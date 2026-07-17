@@ -17,6 +17,8 @@ your own tooling.
 | `tradingview`  | TradingView export (`time,open,high,low,close,volume`)           |
 | `ninjatrader`  | NinjaTrader bar CSV                                              |
 | `tradestation` | TradeStation bar CSV                                             |
+| `binance`      | Binance klines CSV from [data.binance.vision](https://data.binance.vision/) (12 columns, ms timestamps) |
+| `bybit`        | Bybit / Kraken / Coinbase OHLCV CSV (Unix-second timestamps, `open_time` header) |
 | `generic`      | Auto-detects any OHLCV CSV (column names or positional), with an optional manual column-mapping dialog in the GUI |
 
 ## Usage
@@ -40,6 +42,8 @@ python dataconvert.py INPUT OUTPUT --symbol SYM --tf MINUTES [--format FMT]
 python dataconvert.py ticks.csv out.bin --symbol EURUSD --tf 5
 python dataconvert.py bars.csv out.bin --symbol DEU.IDX-EUR --tf 1 --format mt4
 python dataconvert.py history.hst out.bin --symbol EURUSD --tf 5 --format mt4hst
+python dataconvert.py BTCUSDT-1h-2024-01.csv out.bin --symbol BTCUSDT --tf 60 --format binance
+python dataconvert.py BTCUSDT_1_2023.csv out.bin --symbol BTCUSDT --tf 1 --format bybit
 ```
 
 Utility commands:

@@ -10,6 +10,8 @@ Supported input formats:
   tradingview  TradingView export  (time, open, high, low, close, volume)
   ninjatrader  NinjaTrader bar CSV  (date+time semicolon or comma separated)
   tradestation TradeStation bar CSV  (Date, Time, Open, High, Low, Close, ...)
+  binance      Binance historical klines (data.binance.vision ZIP/CSV, ms timestamps)
+  bybit        Bybit / Kraken / generic crypto exchange OHLCV CSV (Unix seconds)
   generic      Auto-detect any OHLCV CSV (column names or positional)
 
 CLI usage:
@@ -17,6 +19,7 @@ CLI usage:
   python dataconvert.py ticks.csv out.bin --symbol DEU.IDX-EUR --tf 5
   python dataconvert.py bars.csv out.bin --symbol USATECH.IDX-USD --tf 1 --format mt4
   python dataconvert.py history.hst out.bin --symbol EURUSD --tf 5 --format mt4hst
+  python dataconvert.py BTCUSDT-1h-2023-01.csv out.bin --symbol BTCUSDT --tf 60 --format binance
 
 Utility commands:
   python dataconvert.py --info FILE.bin       Show header info of a .bin file
@@ -460,8 +463,7 @@ def parse_ninjatrader(path: str, tf_min: int, progress: ProgressFn = None) -> Li
 
 
 def parse_tradestation(path: str, tf_min: int, progress: ProgressFn = None) -> List[Bar]:
-    """
-    TradeStation bar CSV (EasyLanguage format):
+    """"
       "Date","Time","Open","High","Low","Close","Up","Down"
       01/02/2020,07:05,11430.00,11439.00,11428.00,11430.00,100,50
     Date is MM/DD/YYYY; Time is HH:MM (24h).
@@ -499,6 +501,152 @@ def parse_tradestation(path: str, tf_min: int, progress: ProgressFn = None) -> L
                 skipped += 1
     if progress:
         progress(f"  Loaded {len(bars):,} TradeStation bars ({skipped:,} skipped)")
+    return sorted(bars, key=lambda x: x["ts"])
+
+
+def parse_binance(path: str, tf_min: int, progress: ProgressFn = None) -> List[Bar]:
+    """
+    Binance historical klines CSV from data.binance.vision (monthly ZIP/CSV downloads)
+    and Binance API OHLCV export.
+
+    Official 12-column format:
+      open_time,open,high,low,close,volume,close_time,quote_asset_volume,
+      number_of_trades,taker_buy_base_volume,taker_buy_quote_volume,ignore
+      1577836800000,7186.30,7214.58,7172.00,7200.85,4123.47,...
+
+    open_time is Unix **milliseconds** (13 digits).
+    Files downloadable from: https://data.binance.vision/?prefix=data/spot/monthly/klines/
+
+    Example CLI:
+      python dataconvert.py BTCUSDT-1h-2023-01.csv BTCUSDT_H1.bin \\
+             --symbol BTCUSDT --tf 60 --format binance
+    """
+    bars: List[Bar] = []
+    skipped = 0
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        reader = csv.reader(f)
+        for i, row in enumerate(reader):
+            if not row:
+                continue
+            # Skip header row if present ("open_time", "timestamp", etc.)
+            first = row[0].strip()
+            if i == 0 and not first.lstrip('-').replace('.', '', 1).isdigit():
+                continue
+            if len(row) < 5:
+                skipped += 1
+                continue
+            try:
+                t = float(first)
+                # Binance timestamps are ms (13 digits); guard against raw seconds
+                ts = int(t) if t > 1e12 else int(t * 1000)
+                bars.append(_make_bar(
+                    ts,
+                    float(row[1]),  # open
+                    float(row[2]),  # high
+                    float(row[3]),  # low
+                    float(row[4]),  # close
+                ))
+            except (ValueError, IndexError):
+                skipped += 1
+            if progress and i % 100_000 == 0 and i:
+                progress(f"  Parsed {i:,} rows")
+    if progress:
+        progress(f"  Loaded {len(bars):,} Binance bars ({skipped:,} skipped)")
+    return sorted(bars, key=lambda x: x["ts"])
+
+
+def parse_bybit(path: str, tf_min: int, progress: ProgressFn = None) -> List[Bar]:
+    """
+    Bybit / Kraken / generic crypto exchange kline CSV.
+    Covers exchanges that export OHLCV data with Unix **seconds** timestamps
+    and a header row using common column names.
+
+    Bybit historical klines (data.bybit.com):
+      open_time,open,high,low,close,volume,turnover
+      1640995200,46223.30,47183.45,46148.86,47022.00,3892.21,1.83e+08
+
+    Kraken OHLC (api.kraken.com or kraken.com/history):
+      <time>,<open>,<high>,<low>,<close>,<vwap>,<volume>,<count>
+      1609459200,29388.0,29600.0,29000.0,29400.0,29194.7,1234.5,5678
+
+    Coinbase Advanced Trade CSV export:
+      start,open,high,low,close,volume
+      2023-01-01T00:00:00Z,16541.77,16547.70,16530.04,16543.34,123.45
+
+    All columns auto-detected by header name.  Falls back to positional
+    (col 0=ts, col 1=open, col 2=high, col 3=low, col 4=close) if headers
+    aren't recognised.
+
+    Example CLI:
+      python dataconvert.py BTCUSDT_1_2023.csv BTCUSDT_M1.bin \\
+             --symbol BTCUSDT --tf 1 --format bybit
+    """
+    bars: List[Bar] = []
+    skipped = 0
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        sample = f.read(4096)
+        f.seek(0)
+        delim = _auto_delim(sample)
+        reader = csv.reader(f, delimiter=delim)
+
+        # Column index defaults (positional)
+        ts_col, o_col, h_col, l_col, c_col = 0, 1, 2, 3, 4
+        has_header = False
+
+        for i, raw in enumerate(reader):
+            row = [c.strip().strip('"<>') for c in raw]
+            if not row:
+                continue
+
+            if i == 0:
+                hdrs = [h.lower() for h in row]
+                # Check for header row
+                if not row[0].lstrip('-').replace('.', '', 1).isdigit():
+                    has_header = True
+                    def _find(*names) -> int:
+                        for n in names:
+                            for ci, h in enumerate(hdrs):
+                                if h == n or h.startswith(n):
+                                    return ci
+                        return -1
+                    ts_col = _find("open_time", "time", "timestamp", "start", "date")
+                    o_col  = _find("open")
+                    h_col  = _find("high")
+                    l_col  = _find("low")
+                    c_col  = _find("close")
+                    if any(c < 0 for c in [ts_col, o_col, h_col, l_col, c_col]):
+                        # Fall back to positional
+                        ts_col, o_col, h_col, l_col, c_col = 0, 1, 2, 3, 4
+                    continue
+
+            if len(row) <= max(ts_col, o_col, h_col, l_col, c_col):
+                skipped += 1
+                continue
+            try:
+                ts_raw = row[ts_col].strip()
+                # Try numeric Unix timestamp first
+                try:
+                    t = float(ts_raw)
+                    ts = int(t) if t > 1e12 else int(t * 1000)
+                except ValueError:
+                    # ISO 8601 / human-readable date (e.g. Coinbase)
+                    ts = parse_ts(ts_raw)
+                if not ts:
+                    skipped += 1
+                    continue
+                bars.append(_make_bar(
+                    ts,
+                    float(row[o_col]),
+                    float(row[h_col]),
+                    float(row[l_col]),
+                    float(row[c_col]),
+                ))
+            except (ValueError, IndexError):
+                skipped += 1
+            if progress and i % 100_000 == 0 and i:
+                progress(f"  Parsed {i:,} rows")
+    if progress:
+        progress(f"  Loaded {len(bars):,} bars [{path}] ({skipped:,} skipped)")
     return sorted(bars, key=lambda x: x["ts"])
 
 
@@ -601,6 +749,8 @@ FORMATS: Dict[str, tuple] = {
     "tradingview":  (parse_tradingview,  "TradingView export  (time,open,high,low,close,volume)"),
     "ninjatrader":  (parse_ninjatrader,  "NinjaTrader bar CSV  (yyyymmdd hhmmss or date+time ; sep)"),
     "tradestation": (parse_tradestation, "TradeStation bar CSV  (Date,Time,Open,High,Low,Close,...)"),
+    "binance":      (parse_binance,      "Binance klines CSV  (data.binance.vision, 12 columns, ms timestamps)"),
+    "bybit":        (parse_bybit,        "Bybit / Kraken / Coinbase OHLCV CSV  (Unix seconds, open_time header)"),
     "generic":      (parse_generic,      "Auto-detect any OHLCV CSV  (column names or positional)"),
 }
 
@@ -640,6 +790,30 @@ def detect_format(path: str) -> str:
             return "ninjatrader"
         if re.search(r'"date".*"time".*"open"', sample):
             return "tradestation"
+
+        # Binance: first data row has a 13-digit ms timestamp, or header is "open_time,..."
+        # and there are ≥ 6 columns
+        if re.search(r"open_time,open,high,low,close", sample.replace(" ", "")):
+            # Bybit uses Unix seconds, Binance uses ms
+            # Distinguish by first data value: Binance ms = 13 digits
+            for ln in lines[1:]:
+                if ln.strip() and ln.strip()[0].isdigit():
+                    first_val = ln.split(",")[0].strip()
+                    return "binance" if len(first_val) >= 13 else "bybit"
+            return "binance"
+
+        # Binance without header: 12-column CSV with large ms timestamp
+        for ln in lines:
+            stripped = ln.strip()
+            if stripped and stripped[0].isdigit():
+                parts = stripped.split(",")
+                if len(parts) >= 11:
+                    try:
+                        if float(parts[0]) > 1e12:
+                            return "binance"
+                    except ValueError:
+                        pass
+                break
     except OSError:
         pass
 
@@ -842,8 +1016,8 @@ def run_gui() -> None:
              font=(C["ui"][0], 15, "bold")).pack(side="left", padx=16)
     tk.Label(hdr, text="CSV / HST -> BAR6 binary", bg=C["surf"],
              fg=C["dim"]).pack(side="left")
-    tk.Label(hdr, text="Dukascopy - MT4/MT5 - TradingView - NinjaTrader - TradeStation - Generic",
-             bg=C["surf"], fg=C["muted"], font=(C["ui"][0], 8)).pack(side="right", padx=16)
+    tk.Label(hdr, text="Dukascopy · MT4/MT5 · TradingView\nNinjaTrader · TradeStation · Binance · Bybit",
+             bg=C["surf"], fg=C["dim"], font=(C["ui"][0], 7), justify="right").pack(side="right", padx=16)
 
     # == Content ==============================================================
     main = tk.Frame(root, bg=C["bg"], padx=18, pady=10)
