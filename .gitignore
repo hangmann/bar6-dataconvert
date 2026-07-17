@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Output artifacts from DataConvert itself
+*.bin
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

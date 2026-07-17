@@ -1,0 +1,7 @@
+# Normalize line endings on checkin, keep native on checkout
+* text=auto
+
+*.py text
+*.md text
+*.csv text
+*.bin binary
