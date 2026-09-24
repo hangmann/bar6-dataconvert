@@ -36,15 +36,47 @@ follow a known layout.
 ### CLI
 
 ```bash
-python dataconvert.py INPUT OUTPUT --symbol SYM --tf MINUTES [--format FMT]
+python dataconvert.py INPUT OUTPUT --symbol SYM --tf MINUTES [--format FMT] [--tz ZONE]
 
 # Examples
 python dataconvert.py ticks.csv out.bin --symbol EURUSD --tf 5
-python dataconvert.py bars.csv out.bin --symbol DEU.IDX-EUR --tf 1 --format mt4
-python dataconvert.py history.hst out.bin --symbol EURUSD --tf 5 --format mt4hst
+python dataconvert.py bars.csv out.bin --symbol DEU.IDX-EUR --tf 1 --format mt4 --tz Europe/Helsinki
+python dataconvert.py history.hst out.bin --symbol EURUSD --tf 5 --format mt4hst --tz Europe/Helsinki
 python dataconvert.py BTCUSDT-1h-2024-01.csv out.bin --symbol BTCUSDT --tf 60 --format binance
 python dataconvert.py BTCUSDT_1_2023.csv out.bin --symbol BTCUSDT --tf 1 --format bybit
 ```
+
+### Source timezone (`--tz`)
+
+A timestamp is only meaningful once you know what timezone it is in,
+and that is a property of the SOURCE, not of the format. Formats fall into
+three groups:
+
+| Group | `--tz` | Formats |
+|---|---|---|
+| Each record carries its own offset, or the vendor pins the feed to UTC | not needed; refused | `dukascopy` |
+| The value IS an instant (Unix seconds/ms) | not needed; refused | `tradingview`, `binance`, `bybit` |
+| A bare wall clock, with nothing to anchor it | **required** | `mt4`, `mt5`, `mt4hst`, `ninjatrader`, `tradestation`, `generic` |
+
+For the third group the import **aborts** rather than guessing. Reading a
+broker's EET wall clock as UTC is silently wrong by two or three hours, produces
+a correct-looking bar count, and only surfaces later as signals an hour out of
+place.
+
+```bash
+--tz Europe/Helsinki    # most MT4/MT5 brokers (EET/EEST, DST-aware)
+--tz America/New_York   # US exchange local time
+--tz Europe/Berlin      # German local time
+--tz UTC                # the export is already UTC
+--tz +02:00             # a fixed offset that never observes DST
+```
+
+Prefer an IANA zone name over a fixed offset unless the source genuinely does
+not observe DST: only the zone name gets the transition weekends right.
+
+Note that MT4's `.hst` `CTM` field looks like a Unix timestamp and is not one —
+it is the broker's server wall clock encoded as though it were UTC — which is
+why `mt4hst` needs `--tz` like the CSV formats do.
 
 Utility commands:
 
@@ -86,9 +118,9 @@ a flat array of fixed-size records (bars or ticks — never mixed).
 Struct format string: `<IIBIIqq16s`
 
 The predecessor format, **BAR5** (`magic = 0x42415235`, `version = 1`), used a
-shorter header without `payload_type` and `symbol`. BAR5 files can be upgraded
-with `migrate_to_v2.py` (not part of this repo); `dataconvert.py --info`
-recognizes BAR5 files but only reads BAR6 for conversion.
+shorter header without `payload_type` and `symbol`. `dataconvert.py --info`
+recognizes a BAR5 file and says so; to get a BAR6 file, convert the original
+source data again with this tool.
 
 ### Bar record (56 bytes) — `payload_type = 0`
 

@@ -19,15 +19,19 @@
 
 ## Usage
 
+`--tz` is required for the wall-clock formats (mt4, mt5, mt4hst,
+ninjatrader, tradestation, generic) and refused for the rest -- see the
+"Source timezone" section in [../README.md](../README.md).
+
 ```bash
 # Auto-detected:
 python dataconvert.py testcsvs/dukascopy_eurusd.csv out.bin --symbol EUR-USD --tf 5
-python dataconvert.py testcsvs/mt4_dax.csv          out.bin --symbol DEU.IDX-EUR --tf 5
+python dataconvert.py testcsvs/mt4_dax.csv          out.bin --symbol DEU.IDX-EUR --tf 5 --tz Europe/Helsinki
 python dataconvert.py testcsvs/tradingview_nq.csv   out.bin --symbol USATECH.IDX-USD --tf 5
 
 # Generic with obvious labels (auto):
-python dataconvert.py testcsvs/generic_labelled.csv out.bin --symbol TEST --tf 5
+python dataconvert.py testcsvs/generic_labelled.csv out.bin --symbol TEST --tf 5 --tz UTC
 
 # Needs manual mapping — use GUI "Map Columns" button:
-python dataconvert.py testcsvs/random_ab123.csv out.bin --symbol TEST --tf 5 --format generic
+python dataconvert.py testcsvs/random_ab123.csv out.bin --symbol TEST --tf 5 --format generic --tz UTC
 ```
