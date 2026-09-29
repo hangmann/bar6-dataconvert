@@ -85,6 +85,22 @@ python dataconvert.py --info FILE.bin   # Show header info of a .bin file
 python dataconvert.py --formats         # List all supported input formats
 ```
 
+### Records that cannot be market data
+
+Before any file is written, every record is checked, and the conversion is
+**refused** (nothing is written) if one of these is found:
+
+* a high below its low;
+* an open or a close outside its own high and low;
+* a price (open, high, low, close, bid, ask) of zero or less, or one that is not
+  a number (`nan`, `inf`);
+* a time before 1990 or after 2100.
+
+The message names the row of the source file (a `.hst` file: the record number),
+the rule and the values, so the source can be corrected. A bid above its ask is
+possible data and is not refused. A file made by this tool is therefore not one
+that Partiqon's upload refuses for its contents.
+
 ## Requirements
 
 - Python 3.9+

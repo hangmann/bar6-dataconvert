@@ -32,6 +32,7 @@ GUI (no arguments, or --gui):
 
 import argparse
 import csv
+import math
 import os
 import re
 import struct
@@ -73,6 +74,16 @@ Bar = Dict[str, Any]  # {ts: int, open: float, high: float, low: float, close: f
 ProgressFn = Optional[Callable[[str], None]]
 
 TIMEFRAMES = [1, 2, 3, 4, 5, 10, 15, 30, 60, 120, 240, 1440]
+
+# A record time outside this window is a corrupt field, not history: 1990-01-01
+# and 2100-01-01 in epoch milliseconds. Partiqon's upload holds a file to the
+# same window, so a file this tool writes is one it accepts.
+PLAUSIBLE_TS_MIN_MS = 631_152_000_000
+PLAUSIBLE_TS_MAX_MS = 4_102_444_800_000
+
+# No instrument trades at a billion: a price above this is a corrupt field.
+# Partiqon's upload and engine hold a file to the same ceiling.
+MAX_PRICE = 1_000_000_000.0
 
 # =============================================================================
 # Timestamp parsers
@@ -170,6 +181,32 @@ class RecordsNotInOrder(ValueError):
     def __init__(self, message, offenders=None, counts=None):
         super().__init__(message)
         self.offenders = list(offenders or ())
+        self.counts = counts
+
+
+class RecordsInvalid(ValueError):
+    """Raised when records of the payload cannot be market data, so nothing is written.
+
+    A bar whose high is below its low, whose open or close lies outside that
+    range, a price of zero or less, a value that is not a number and a time
+    that is not a plausible date are all things a file cannot contain and still
+    be used: an engine reading it computes on impossible prices. The check is
+    the same one Partiqon's upload makes of every record, made here so the
+    source is corrected now rather than when the file is uploaded.
+
+    Attributes:
+      offenders  list of dicts {"where", "ts", "reason", "values"}; `where` is
+                 "row N" (a line of the source file) or "bar N" / "tick N" (the
+                 payload's own position, for a payload built from many rows).
+                 Only the first few are kept.
+      bad        how many records were refused.
+      counts     the conversion counts, attached by `convert()`.
+    """
+
+    def __init__(self, message, offenders=None, bad=0, counts=None):
+        super().__init__(message)
+        self.offenders = list(offenders or ())
+        self.bad = bad
         self.counts = counts
 
 
@@ -659,15 +696,171 @@ def _refuse_unordered(records: List[Dict], path: str, what: str,
         offenders=offenders)
 
 
+# =============================================================================
+# Content checks
+# =============================================================================
+#
+# What a record must be to be market data at all. Partiqon's upload checks every
+# record of a file against exactly these rules, so a file that passes here is not
+# refused there. Two writers below and the row audit in every parser use them.
+#
+#   a time inside PLAUSIBLE_TS_MIN_MS .. PLAUSIBLE_TS_MAX_MS
+#   every price (bar: open, high, low, close, bid, ask; tick: bid, ask) a number
+#   every price above zero, and not above MAX_PRICE
+#   bar: high not below low, open and close inside [low, high]
+#
+# One reason per record, the first that applies, in that order. Quotes that are
+# possible but poor -- a bid above its ask, gaps, spikes -- are not refused.
+
+_BAR_PRICES = ("open", "high", "low", "close", "bid", "ask")
+_TICK_PRICES = ("bid", "ask")
+
+#: How many offending records a refusal names before it says "and N more".
+REFUSAL_NAMES = 5
+
+
+def record_problem(rec: Dict, tick: bool = False) -> Optional[str]:
+    """Why `rec` (a bar dict, or a tick dict when `tick`) cannot be market data,
+    or None when it can."""
+    ts = rec["ts"]
+    if not (PLAUSIBLE_TS_MIN_MS <= ts <= PLAUSIBLE_TS_MAX_MS):
+        return "its time is not a plausible date"
+    names = _TICK_PRICES if tick else _BAR_PRICES
+    for n in names:
+        if not math.isfinite(rec[n]):
+            return "it holds a value that is not a number"
+    for n in names:
+        if not rec[n] > 0.0:
+            return "it holds a price of zero or less"
+    for n in names:
+        if rec[n] > MAX_PRICE:
+            return "it holds a price above 1,000,000,000"
+    if not tick:
+        lo, hi = rec["low"], rec["high"]
+        if hi < lo:
+            return "its high is below its low"
+        if rec["open"] < lo or rec["open"] > hi:
+            return "it opens outside its own high and low"
+        if rec["close"] < lo or rec["close"] > hi:
+            return "it closes outside its own high and low"
+    return None
+
+
+def _when_safe(ts) -> str:
+    """A record's time for a message; a time no calendar holds is shown as the raw number."""
+    try:
+        return ts_to_str_exact(int(ts))
+    except (OverflowError, OSError, ValueError):
+        return "%s ms" % (ts,)
+
+
+def _values_of(rec: Dict, tick: bool) -> str:
+    names = _TICK_PRICES if tick else ("open", "high", "low", "close")
+    return ", ".join("%s %r" % (n, rec[n]) for n in names)
+
+
+class _RowAudit:
+    """The first few source rows a parser found that cannot be market data, and
+    how many there were. O(1) memory: a tick export has tens of millions of rows."""
+
+    def __init__(self, keep: int = REFUSAL_NAMES):
+        self.keep = keep
+        self.bad = 0
+        self.first: List[Dict] = []
+
+    def note(self, where: str, rec: Dict, reason: str, tick: bool) -> None:
+        self.bad += 1
+        if len(self.first) < self.keep:
+            self.first.append({"where": where, "ts": rec["ts"], "reason": reason,
+                               "values": _values_of(rec, tick)})
+
+
+class _Counts(dict):
+    """new_conversion_counts()'s dict: the counts, plus the row audit the parsers
+    feed. Unpacking or copying it gives the counts alone."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.audit = _RowAudit()
+
+
+def _audit(stats, rec: Dict, row: int, tick: bool = False, unit: str = "row") -> None:
+    """Check the record a parser has just built from source row `row` (a
+    conversion's counts carry the audit; a parser called without them is not
+    audited, and the writers still check the payload)."""
+    audit = getattr(stats, "audit", None)
+    if audit is None:
+        return
+    reason = record_problem(rec, tick)
+    if reason is not None:
+        audit.note("%s %d" % (unit, row), rec, reason, tick)
+
+
+def _refusal_lines(entries: List[Dict], bad: int) -> str:
+    lines = ["  %s (%s): %s  [%s]" % (e["where"], _when_safe(e["ts"]), e["reason"], e["values"])
+             for e in entries]
+    if bad > len(entries):
+        lines.append("  ... and %d more" % (bad - len(entries)))
+    return "\n".join(lines)
+
+
+def _refuse_audited(stats, path: str) -> None:
+    """Raise RecordsInvalid, naming source rows, when the parsers found any that
+    cannot be market data. Called after parsing and BEFORE the output file is
+    created."""
+    audit = getattr(stats, "audit", None)
+    if audit is None or not audit.bad:
+        return
+    total = stats.get("rows_parsed", 0)
+    raise RecordsInvalid(
+        "Refusing to write %s: %d of %d source rows cannot be market data, and "
+        "Partiqon's upload would refuse a file holding them.\n%s\n"
+        "Row numbers are lines of the source file, the header included.\n"
+        "Correct these rows in the source and convert it again. Nothing was written."
+        % (path, audit.bad, total, _refusal_lines(audit.first, audit.bad)),
+        offenders=audit.first, bad=audit.bad)
+
+
+def _refuse_invalid(records: List[Dict], path: str, what: str) -> None:
+    """Raise RecordsInvalid unless every record of the payload can be market
+    data. Writes nothing either way; called BEFORE the output file is created,
+    like _refuse_unordered. Names the payload's own positions -- for a payload
+    built from many source rows (ticks aggregated into bars) there is no single
+    source row to name."""
+    tick = what == "tick"
+    entries: List[Dict] = []
+    bad = 0
+    for i, rec in enumerate(records):
+        reason = record_problem(rec, tick)
+        if reason is None:
+            continue
+        bad += 1
+        if len(entries) < REFUSAL_NAMES:
+            entries.append({"where": "%s %d" % (what, i + 1), "ts": rec["ts"],
+                            "reason": reason, "values": _values_of(rec, tick)})
+    if not bad:
+        return
+    raise RecordsInvalid(
+        "Refusing to write %s: %d of %d %ss cannot be market data, and Partiqon's "
+        "upload would refuse a file holding them.\n%s\n"
+        "Positions are in the payload that would have been written (sorted by "
+        "time; bars made from ticks hold many source rows), not lines of the "
+        "source file.\nCorrect the source data and convert it again. Nothing was "
+        "written." % (path, bad, len(records), what, _refusal_lines(entries, bad)),
+        offenders=entries, bad=bad)
+
+
 def write_v2(path: str, bars: List[Bar], symbol: str, tf_min: int) -> int:
     """Write bars list to a BAR6 .bin file. Returns total bytes written.
 
     Refuses a payload that does not ascend strictly. A bar source is
     sorted by every parser here, but nothing de-duplicates it, so two CSV rows
-    stamped the same minute used to become two records in the file.
+    stamped the same minute used to become two records in the file. Refuses a
+    payload with a bar that cannot be market data (see the content checks).
     """
     if not bars:
         raise ValueError("No bars to write")
+    _refuse_invalid(bars, path, "bar")
     _refuse_unordered(bars, path, "bar", allow_repeats=False)
     first_ts, last_ts = _payload_span(bars)
     sym_b = symbol.encode("ascii", errors="replace")[:16].ljust(16, b"\x00")
@@ -696,10 +889,11 @@ def write_ticks_v2(path: str, ticks: List[Dict], symbol: str) -> int:
     returns arrival order and has never sorted, so a shuffled or concatenated
     export used to be written out of order, with a header whose start was later
     than its end. Repeated timestamps are still accepted: many ticks share a
-    millisecond.
+    millisecond. Refuses a payload with a tick that cannot be market data.
     """
     if not ticks:
         raise ValueError("No ticks to write")
+    _refuse_invalid(ticks, path, "tick")
     _refuse_unordered(ticks, path, "tick", allow_repeats=True)
     first_ts, last_ts = _payload_span(ticks)
     sym_b = symbol.encode("ascii", errors="replace")[:16].ljust(16, b"\x00")
@@ -770,13 +964,13 @@ def new_conversion_counts() -> Dict[str, int]:
                           it is the difference between "this file did not span
                           a transition" and "nobody looked".
     """
-    return {
+    return _Counts({
         "rows_parsed": 0,
         "skipped_rows": 0,
         "out_of_order_rows": 0,
         "duplicate_timestamps": 0,
         "dst_repeated_rows": 0,
-    }
+    })
 
 
 def _measure_timestamps(records: List[Dict]) -> tuple:
@@ -953,6 +1147,7 @@ def parse_dukascopy_ticks(path: str, progress: ProgressFn = None,
                 ask = float(row[1])
                 bid = float(row[2])
                 ticks.append({"ts": ts, "bid": bid, "ask": ask})
+                _audit(stats, ticks[-1], reader.line_num, tick=True)
             except ValueError:
                 skipped += 1
             if progress and i % 250_000 == 0 and i:
@@ -1019,6 +1214,7 @@ def parse_mt4(path: str, tf_min: int, progress: ProgressFn = None,
                     continue
                 bars.append(_make_bar(ts, float(row[o_col]), float(row[h_col]),
                                       float(row[l_col]), float(row[c_col])))
+                _audit(stats, bars[-1], reader.line_num)
             except (ValueError, IndexError):
                 skipped += 1
             if progress and i % 100_000 == 0 and i:
@@ -1075,6 +1271,7 @@ def parse_mt4hst(path: str, tf_min: int, progress: ProgressFn = None,
         for i in range(n):
             time_s, o, low, high, c, _ = struct.unpack_from(FMT, data, i * SZ)
             bars.append(_make_bar(_ctm_to_utc_ms(time_s), o, high, low, c))
+            _audit(stats, bars[-1], i + 1, unit="record")
     else:  # 401
         # CTM(int64) OPEN HIGH LOW CLOSE  tick_vol(uint64) spread(int32) real_vol(uint64)
         FMT, SZ = "<qddddQiQ", 60
@@ -1082,6 +1279,7 @@ def parse_mt4hst(path: str, tf_min: int, progress: ProgressFn = None,
         for i in range(n):
             time_s, o, high, low, c, _tv, _sp, _rv = struct.unpack_from(FMT, data, i * SZ)
             bars.append(_make_bar(_ctm_to_utc_ms(time_s), o, high, low, c))
+            _audit(stats, bars[-1], i + 1, unit="record")
 
     if progress:
         symbol_raw = raw[4:68].rstrip(b"\x00").decode("ascii", errors="replace")
@@ -1117,6 +1315,7 @@ def parse_tradingview(path: str, tf_min: int, progress: ProgressFn = None,
                 ts = int(t * 1000) if t < 1e12 else int(t)
                 bars.append(_make_bar(ts, float(row[1]), float(row[2]),
                                       float(row[3]), float(row[4])))
+                _audit(stats, bars[-1], reader.line_num)
             except ValueError:
                 skipped += 1
     if progress:
@@ -1163,6 +1362,7 @@ def parse_ninjatrader(path: str, tf_min: int, progress: ProgressFn = None,
                 ci = 1 if " " in row[0] else 2
                 bars.append(_make_bar(ts, float(row[ci]), float(row[ci+1]),
                                       float(row[ci+2]), float(row[ci+3])))
+                _audit(stats, bars[-1], reader.line_num)
             except (ValueError, IndexError):
                 skipped += 1
     if progress:
@@ -1210,6 +1410,7 @@ def parse_tradestation(path: str, tf_min: int, progress: ProgressFn = None,
                     continue
                 bars.append(_make_bar(ts, float(row[o_col]), float(row[h_col]),
                                       float(row[l_col]), float(row[c_col])))
+                _audit(stats, bars[-1], reader.line_num)
             except (ValueError, IndexError):
                 skipped += 1
     if progress:
@@ -1262,6 +1463,7 @@ def parse_binance(path: str, tf_min: int, progress: ProgressFn = None,
                     float(row[3]),  # low
                     float(row[4]),  # close
                 ))
+                _audit(stats, bars[-1], reader.line_num)
             except (ValueError, IndexError):
                 skipped += 1
             if progress and i % 100_000 == 0 and i:
@@ -1322,9 +1524,15 @@ def parse_bybit(path: str, tf_min: int, progress: ProgressFn = None,
                 if not row[0].lstrip('-').replace('.', '', 1).isdigit():
                     has_header = True
                     def _find(*names) -> int:
+                        # An exact header name beats a longer one that merely
+                        # starts with it: "open" is the price column, not
+                        # "open_time", which comes first in a Bybit export.
                         for n in names:
                             for ci, h in enumerate(hdrs):
-                                if h == n or h.startswith(n):
+                                if h == n:
+                                    return ci
+                            for ci, h in enumerate(hdrs):
+                                if h.startswith(n):
                                     return ci
                         return -1
                     ts_col = _find("open_time", "time", "timestamp", "start", "date")
@@ -1359,6 +1567,7 @@ def parse_bybit(path: str, tf_min: int, progress: ProgressFn = None,
                     float(row[l_col]),
                     float(row[c_col]),
                 ))
+                _audit(stats, bars[-1], reader.line_num)
             except (ValueError, IndexError):
                 skipped += 1
             if progress and i % 100_000 == 0 and i:
@@ -1384,7 +1593,9 @@ def parse_generic(path: str, tf_min: int, progress: ProgressFn = None,
         f.seek(0)
         delim = _auto_delim(sample)
         reader = csv.reader(f, delimiter=delim)
-        rows = [r for r in reader if any(c.strip() for c in r)]
+        numbered = [(reader.line_num, r) for r in reader if any(c.strip() for c in r)]
+        rows = [r for _, r in numbered]
+        line_of = [n for n, _ in numbered]      # the line each kept row ends on
 
     if not rows:
         raise ValueError("File appears empty")
@@ -1409,9 +1620,14 @@ def parse_generic(path: str, tf_min: int, progress: ProgressFn = None,
 
         if has_header:
             def find(*names) -> int:
+                # An exact header name beats one that merely contains it:
+                # "open" is the price column, not "open_time".
                 for n in names:
                     for ci, h in enumerate(raw_hdr):
-                        if n == h or n in h:
+                        if n == h:
+                            return ci
+                    for ci, h in enumerate(raw_hdr):
+                        if n in h:
                             return ci
                 return -1
             date_col = find("date", "datetime", "timestamp", "time")
@@ -1443,7 +1659,8 @@ def parse_generic(path: str, tf_min: int, progress: ProgressFn = None,
     bars: List[Bar] = []
     skipped = 0
     clock = SourceClock(tz)          # one per FILE, read in row order
-    for row in data_rows:
+    first_data = len(rows) - len(data_rows)     # data_rows is rows without its header, or all
+    for k, row in enumerate(data_rows):
         try:
             t_str = row[time_col].strip() if 0 <= time_col < len(row) else ""
             ts = parse_ts(row[date_col].strip(), t_str, tz, clock)
@@ -1452,6 +1669,7 @@ def parse_generic(path: str, tf_min: int, progress: ProgressFn = None,
                 continue
             bars.append(_make_bar(ts, float(row[o_col]), float(row[h_col]),
                                   float(row[l_col]), float(row[c_col])))
+            _audit(stats, bars[-1], line_of[first_data + k])
         except (ValueError, IndexError):
             skipped += 1
     if progress:
@@ -1545,6 +1763,19 @@ def detect_format(path: str) -> str:
 # =============================================================================
 # Main convert function
 # =============================================================================
+def _refuse_audited_with_counts(stats, output_path: str, progress: ProgressFn,
+                                tick_payload: bool = False) -> None:
+    """_refuse_audited, with the conversion counts attached to the refusal and
+    reported, as for the ordering refusal."""
+    try:
+        _refuse_audited(stats, output_path)
+    except RecordsInvalid as exc:
+        exc.counts = dict(stats)
+        if progress:
+            progress(counts_summary(stats, tick_payload=tick_payload))
+        raise
+
+
 def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
             fmt: Optional[str] = None, progress: ProgressFn = None,
             as_ticks: bool = False,
@@ -1574,8 +1805,10 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
 
     Raises RecordsNotInOrder, with those same counts attached, when the payload
     would not ascend: a raw tick export written in arrival order or two bars
-    stamped one instant. No output file is created in that
-    case. `start` and `end` in the returned dict are the payload's earliest and
+    stamped one instant. Raises RecordsInvalid, with the counts too, when a
+    record cannot be market data (a high below its low, a price of zero or
+    less, a value that is not a number): it names the source rows. No output
+    file is created in either case. `start` and `end` in the returned dict are the payload's earliest and
     latest timestamp, not its first and last record.
     """
     if not os.path.exists(input_path):
@@ -1611,6 +1844,7 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
         ticks = parse_dukascopy_ticks(input_path, progress, stats=stats)
         if not ticks:
             raise ValueError("No ticks could be parsed from the input file")
+        _refuse_audited_with_counts(stats, output_path, progress, tick_payload=True)
         if progress:
             progress(f"Writing {len(ticks):,} raw ticks -> {os.path.basename(output_path)}")
         # write_ticks_v2 refuses a payload that descends. The counts
@@ -1619,7 +1853,7 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
         # the source's problem, where the exception alone names only ours.
         try:
             n_bytes = write_ticks_v2(output_path, ticks, symbol)
-        except RecordsNotInOrder as exc:
+        except (RecordsNotInOrder, RecordsInvalid) as exc:
             exc.counts = dict(stats)
             if progress:
                 progress(counts_summary(stats, tick_payload=True))
@@ -1654,6 +1888,7 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
         bars = parser_fn(input_path, tf_min, progress, tz=source_tz, stats=stats)
     if not bars:
         raise ValueError("No bars could be parsed from the input file")
+    _refuse_audited_with_counts(stats, output_path, progress)
 
     if progress:
         progress(f"Writing {len(bars):,} M{tf_min} bars -> {os.path.basename(output_path)}")
@@ -1662,7 +1897,7 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
     # reasoning as the tick path above -- the counts explain the refusal.
     try:
         n_bytes = write_v2(output_path, bars, symbol, tf_min)
-    except RecordsNotInOrder as exc:
+    except (RecordsNotInOrder, RecordsInvalid) as exc:
         exc.counts = dict(stats)
         if progress:
             progress(counts_summary(stats))
