@@ -4,22 +4,34 @@ DataConvert - Universal market data -> BAR6 binary converter.
 
 Supported input formats:
   dukascopy    Dukascopy tick CSV  (LocalTime, Ask, Bid, AskVolume, BidVolume)
-  mt4          MT4 bar CSV  (<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,...)
+  mt5ticks     MT5 tick export  (<DATE> <TIME> <BID> <ASK> <LAST> <VOLUME> <FLAGS>)
+  ninjatraderticks  NinjaTrader tick export  (yyyyMMdd HHmmss fffffff;last;bid;ask;volume)
+  genericticks Any tick CSV with a header naming a time, a bid and an ask column
+  mt4          MT4 bar CSV  (<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,...,<SPREAD>)
   mt4hst       MT4 .hst binary history file (versions 400 and 401)
   mt5          MT5 bar CSV  (same layout as MT4, tab or comma delimited)
   tradingview  TradingView export  (time, open, high, low, close, volume)
-  ninjatrader  NinjaTrader bar CSV  (date+time semicolon or comma separated)
+  ninjatrader  NinjaTrader bar CSV  (date+time, or a daily bar's date alone; ; or , separated)
   tradestation TradeStation bar CSV  (Date, Time, Open, High, Low, Close, ...)
   binance      Binance historical klines (data.binance.vision ZIP/CSV, ms timestamps)
   bybit        Bybit / Kraken / generic crypto exchange OHLCV CSV (Unix seconds)
   generic      Auto-detect any OHLCV CSV (column names or positional)
 
+Spreads: the four tick formats carry a bid and an ask per tick, so their ticks
+(--ticks) and the bars made from them (--tf) keep the quoted spread. An MT4/MT5
+bar CSV with a <SPREAD> column and an MT4 .hst file of version 401 carry one
+spread per bar, which is kept too. The other formats carry no quotes: their
+bars are written with bid = ask = close.
+
 CLI usage:
-  python dataconvert.py INPUT OUTPUT --symbol SYM --tf MINUTES [--format FMT]
+  python dataconvert.py INPUT OUTPUT --symbol SYM --tf MINUTES [--format FMT] [--tz ZONE]
   python dataconvert.py ticks.csv out.bin --symbol DEU.IDX-EUR --tf 5
-  python dataconvert.py bars.csv out.bin --symbol USATECH.IDX-USD --tf 1 --format mt4
-  python dataconvert.py history.hst out.bin --symbol EURUSD --tf 5 --format mt4hst
-  python dataconvert.py BTCUSDT-1h-2023-01.csv out.bin --symbol BTCUSDT --tf 60 --format binance
+  python dataconvert.py bars.csv out.bin --symbol USATECH.IDX-USD --tf 1 --format mt4 --tz Europe/Helsinki
+  python dataconvert.py history.hst out.bin --symbol EURUSD --tf 5 --format mt4hst --tz Europe/Helsinki
+  python dataconvert.py BTCUSDT-1h-2024-01.csv out.bin --symbol BTCUSDT --tf 60 --format binance
+
+  --tz is required for the formats that store a local clock (mt4, mt5, mt4hst,
+  mt5ticks, ninjatrader, ninjatraderticks, tradestation, generic, genericticks).
 
 Utility commands:
   python dataconvert.py --info FILE.bin       Show header info of a .bin file
@@ -28,16 +40,24 @@ Utility commands:
 GUI (no arguments, or --gui):
   python dataconvert.py
   python dataconvert.py --gui
+
+Memory: every row of the input is held in memory while it converts, about
+313 MB per million rows. Before converting, the tool estimates what the file
+needs and stops with a message when that is more than the computer has
+available (--ignore-memory-check converts anyway).
 """
 
 import argparse
+import base64
 import csv
+import io
 import math
 import os
 import re
 import struct
 import sys
 import threading
+import zipfile
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -94,7 +114,9 @@ _RE_DUKA = re.compile(
 )
 _RE_MT   = re.compile(r"^(\d{4})[.\-/](\d{2})[.\-/](\d{2})$")
 _RE_US   = re.compile(r"^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$")
-_RE_NT   = re.compile(r"^(\d{8}) (\d{6})$")
+_RE_NT   = re.compile(r"^(\d{8}) (\d{6})(?:[.,](\d+))?$")
+# A NinjaTrader daily bar's date alone: "20240102" (yyyymmdd, no time).
+_RE_NT_DATE = re.compile(r"^\d{8}$")
 
 _RE_FIXED_OFFSET = re.compile(r"^(?:UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
 
@@ -134,6 +156,11 @@ _RE_FIXED_OFFSET = re.compile(r"^(?:UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2}))?$", re
 #: safety net and not the normal path.
 TZ_POLICY: Dict[str, str] = {
     "dukascopy":    "in_data",
+    # MT5 stamps ticks with the broker's server clock, NinjaTrader with the
+    # display zone set in the platform; a generic tick CSV says nothing.
+    "mt5ticks":         "wall",
+    "ninjatraderticks": "wall",
+    "genericticks":     "wall",
     "mt4":          "wall",
     "mt4hst":       "wall",
     "mt5":          "wall",
@@ -210,12 +237,71 @@ class RecordsInvalid(ValueError):
         self.counts = counts
 
 
+# ── Zone names on a Python without a time zone database ──────────────────────
+#
+# Python reads a zone name from the operating system's IANA time zone database
+# or from the tzdata package. Windows has neither unless tzdata is installed,
+# and there `--tz Europe/Berlin` used to be refused. DataConvert therefore
+# carries the rules of the zones below: the IANA database's own files, byte for
+# byte (version ZONES_VERSION; the database is in the public domain), stored at
+# the end of this file. They are used only when Python has no database of its
+# own; one that Python has is used first, because it may be newer. Any other
+# zone name on such a Python is refused with a message saying how to install
+# the database.
+
+_CARRIED: Dict[str, tzinfo] = {}
+
+
+def carried_zone(name: str) -> Optional[tzinfo]:
+    """The zone `name` from the rules DataConvert carries, or None when it
+    carries no such zone."""
+    if name not in _CARRIED:
+        data = _ZONES.get(name)
+        if data is None:
+            return None
+        _CARRIED[name] = ZoneInfo.from_file(io.BytesIO(base64.b64decode("".join(data))),
+                                            key=name)
+    return _CARRIED[name]
+
+
+def is_carried(tz: Optional[tzinfo]) -> bool:
+    """True when `tz` came from the rules DataConvert carries."""
+    return any(tz is z for z in _CARRIED.values())
+
+
+def has_zone_database() -> bool:
+    """True when this Python can read zone names by itself (the operating
+    system's database, or the tzdata package)."""
+    try:
+        ZoneInfo("UTC")
+        return True
+    except ZoneInfoNotFoundError:
+        return False
+
+
+def _unknown_zone(spec: str, why: str) -> ValueError:
+    if not has_zone_database():
+        return ValueError(
+            f"Unknown timezone {spec!r}: this Python has no time zone database "
+            f"(Windows ships none), and DataConvert carries the rules of these "
+            f"zones only:\n  {', '.join(sorted(_ZONES))}\n"
+            f"To use any other zone name, install the database once:\n"
+            f"  python -m pip install tzdata\n"
+            f"or give a fixed offset that never observes DST, such as +05:30.")
+    return ValueError(
+        f"Unknown timezone {spec!r}: {why}\n"
+        f"Give an IANA zone name or a fixed offset. Examples:\n{_TZ_EXAMPLES}")
+
+
 def resolve_tz(spec: Optional[str]) -> Optional[tzinfo]:
     """Turn a --tz string into a tzinfo. None stays None.
 
     Accepts an IANA zone name ("Europe/Helsinki"), which is what makes DST
     handling correct across a transition, or a fixed offset ("+02:00", "-5",
     "UTC+02:00") for sources that genuinely never shift.
+
+    A zone name is read from Python's own time zone database when it has one,
+    else from the rules DataConvert carries (see carried_zone).
     """
     if spec is None:
         return None
@@ -237,7 +323,12 @@ def resolve_tz(spec: Optional[str]) -> Optional[tzinfo]:
 
     try:
         return ZoneInfo(spec)
-    except (ZoneInfoNotFoundError, ValueError) as exc:
+    except ZoneInfoNotFoundError as exc:
+        carried = carried_zone(spec)
+        if carried is not None:
+            return carried
+        raise _unknown_zone(spec, str(exc)) from exc
+    except ValueError as exc:            # not a zone name at all ("../x")
         raise ValueError(
             f"Unknown timezone {spec!r}: {exc}\n"
             f"Give an IANA zone name or a fixed offset. Examples:\n{_TZ_EXAMPLES}"
@@ -343,9 +434,24 @@ class SourceClock:
       and nothing is claimed: `isinstance(tz, timezone)` short-circuits the
       whole check. A broker that DOES observe DST read through a fixed offset
       still collides, and `write_v2`'s refusal message says so.
+
+    TICKS (`repeats=True`)
+    ----------------------
+    Many ticks share a millisecond, so for a tick source "this label was seen
+    before" says nothing about which copy of the hour a row is in. There the
+    repeated copy starts where the clock steps BACK inside the ambiguous hour,
+    by at least `TICK_STEP_BACK`: the first copy runs forward, and the second
+    starts again at the top of the hour. A step back shorter than that is
+    read as the source's own jitter, not as the clocks going back. Every row
+    after the step, up to the end of the ambiguous hour, is in the repeated
+    copy.
     """
 
-    def __init__(self, tz: Optional[tzinfo] = None):
+    #: The smallest step back in a tick source's wall clock that is read as
+    #: the start of the repeated hour (see TICKS above).
+    TICK_STEP_BACK = timedelta(seconds=1)
+
+    def __init__(self, tz: Optional[tzinfo] = None, repeats: bool = False):
         self.tz = tz
         #: Rows this clock has resolved. Also the ordinal in `nonexistent`.
         self.rows = 0
@@ -358,6 +464,11 @@ class SourceClock:
         # calls on every row of every file for an answer that is always "no".
         self._dst_aware = tz is not None and not isinstance(tz, timezone)
         self._seen: Dict[datetime, int] = {}
+        # Tick sources: the previous label inside the ambiguous hour, and
+        # whether the clock has stepped back into the repeated copy.
+        self._repeats = repeats
+        self._previous: Optional[datetime] = None
+        self._second_copy = False
 
     def to_utc_ms(self, dt_naive: datetime) -> int:
         """This row's wall clock as Unix ms, resolved against the rows before it."""
@@ -375,6 +486,8 @@ class SourceClock:
             # months of rows away. Clearing here is what keeps the map to at
             # most one hour of labels rather than the whole file's.
             self._seen.clear()
+            self._previous = None
+            self._second_copy = False
             return int(dt_naive.replace(tzinfo=tz).timestamp() * 1000)
 
         if off0 < off1:
@@ -383,6 +496,16 @@ class SourceClock:
             # with every offending row named. Raising from here would land in
             # the per-row `except (ValueError, IndexError)` every parser has and
             # be reported as an unreadable row instead.
+            return int(dt_naive.replace(tzinfo=tz, fold=0).timestamp() * 1000)
+
+        if self._repeats:
+            previous, self._previous = self._previous, dt_naive
+            if (not self._second_copy and previous is not None
+                    and previous - dt_naive >= self.TICK_STEP_BACK):
+                self._second_copy = True
+            if self._second_copy:
+                self.repeated_hour_rows += 1
+                return int(dt_naive.replace(tzinfo=tz, fold=1).timestamp() * 1000)
             return int(dt_naive.replace(tzinfo=tz, fold=0).timestamp() * 1000)
 
         seen = self._seen.get(dt_naive, 0)
@@ -436,8 +559,59 @@ def _wall(dt_naive: datetime, tz: Optional[tzinfo],
             else wallclock_to_utc_ms(dt_naive, tz))
 
 
+# ISO 8601 as exporters write it, read field by field. datetime.fromisoformat
+# reads the basic format ("20240102T070000"), offsets without a colon ("+0100",
+# "+01") and fractions of other than 3 or 6 digits only from Python 3.11 on,
+# and DataConvert runs on 3.9 and 3.10 too. The date and the time each use one
+# form, extended or basic, as 3.11+ requires; a fraction keeps microseconds.
+_RE_ISO_DATE = re.compile(r"(\d{4})(-?)(\d{2})\2(\d{2})")
+_RE_ISO_TIME = re.compile(r"(\d{2})(?:(:?)(\d{2})(?:\2(\d{2})(?:[.,](\d+))?)?)?"
+                          r"(?:([+-])(\d{2})(?::?(\d{2}))?)?")
+
+
+def _iso_datetime(text: str) -> datetime:
+    """`text` read the way datetime.fromisoformat reads it on Python 3.11+.
+
+    The spellings above are parsed here, so every Python version gives the
+    same value; anything else (week dates, other separators, offsets with
+    seconds) is left to datetime.fromisoformat, which raises ValueError where
+    it cannot read it.
+    """
+    d = _RE_ISO_DATE.match(text)
+    rest = text[d.end():] if d else ""
+    t = (_RE_ISO_TIME.fullmatch(rest[1:])
+         if d and len(rest) > 1 and rest[0] in "Tt " else None)
+    if d and (rest == "" or t):
+        hh, _, mi, ss, frac, sign, oh, om = t.groups() if t else (None,) * 8
+        try:
+            tzi = None
+            if sign:
+                offset = timedelta(hours=int(oh), minutes=int(om or 0))
+                tzi = timezone(-offset if sign == "-" else offset)
+            return datetime(int(d.group(1)), int(d.group(3)), int(d.group(4)),
+                            int(hh or 0), int(mi or 0), int(ss or 0),
+                            int((frac or "")[:6].ljust(6, "0")), tzinfo=tzi)
+        except ValueError:
+            pass        # no such date or time: fromisoformat gives its own answer
+    return datetime.fromisoformat(text)
+
+
+def _seconds(field: str, fraction: bool) -> Tuple[int, int]:
+    """(seconds, microseconds) of a time's seconds field ("12", "12.108").
+
+    Without `fraction` the fraction is dropped, as bar exports have always been
+    read; with it (tick sources) the digits after the point are kept, up to
+    six."""
+    if not fraction:
+        return int(float(field)), 0
+    whole, _, frac = field.partition(".")
+    if frac and not frac.isdigit():
+        raise ValueError(f"not a seconds field: {field!r}")
+    return int(whole), int(frac[:6].ljust(6, "0")) if frac else 0
+
+
 def parse_ts(date_str: str, time_str: str = "", tz: Optional[tzinfo] = None,
-             clock: Optional[SourceClock] = None) -> int:
+             clock: Optional[SourceClock] = None, fraction: bool = False) -> int:
     """Parse various date/time strings -> Unix milliseconds. Returns 0 on failure.
 
     `tz` is the source timezone for the branches that read a bare wall clock.
@@ -448,6 +622,10 @@ def parse_ts(date_str: str, time_str: str = "", tz: Optional[tzinfo] = None,
     resolve a repeated DST hour by the position of the row within the file;
     without one they keep the documented `fold=0` reading, which is the only
     thing a single call can decide.
+
+    `fraction` keeps a fraction of a second ("08:00:12.108") in the MT and US
+    date branches, which tick sources need; bar sources leave it off and read
+    whole seconds, as before. The other branches keep a fraction either way.
     """
     s = date_str.strip()
     t = time_str.strip()
@@ -468,12 +646,21 @@ def parse_ts(date_str: str, time_str: str = "", tz: Optional[tzinfo] = None,
         return int(dt.timestamp() * 1000)
 
     # NinjaTrader compact: "20200102 070500" — wall clock, needs `tz`.
-    m = _RE_NT.match(s)
+    # Matched against the date and the time TOGETHER: the parsers split the
+    # stamp ("20200102", "070500") or read it from two columns, so matching
+    # the date alone never hit, and the layout was read only by the ISO
+    # fallback below, whose datetime.fromisoformat reads this basic format
+    # from Python 3.11 on. On Python 3.10 every row was skipped. Parsed here
+    # field by field, so every Python version gives the same value. A
+    # fraction of a second keeps the value 3.11+ gave: microseconds, digits
+    # beyond six cut.
+    m = _RE_NT.match(s + " " + t if t else s)
     if m:
-        d, ti = m.groups()
+        d, ti, frac = m.groups()
         return _wall(
             datetime(int(d[:4]), int(d[4:6]), int(d[6:8]),
-                     int(ti[:2]), int(ti[2:4]), int(ti[4:6])), tz, clock)
+                     int(ti[:2]), int(ti[2:4]), int(ti[4:6]),
+                     int((frac or "")[:6].ljust(6, "0"))), tz, clock)
 
     # MT4/MT5/ISO date: "2020.01.02" or "2020-01-02" with optional separate time
     # — wall clock in the broker's server timezone, needs `tz`.
@@ -483,9 +670,9 @@ def parse_ts(date_str: str, time_str: str = "", tz: Optional[tzinfo] = None,
         tp = t.split(":") if t else ["0", "0", "0"]
         hh = int(tp[0]) if len(tp) > 0 else 0
         mi = int(tp[1]) if len(tp) > 1 else 0
-        ss = int(float(tp[2])) if len(tp) > 2 else 0
+        ss, us = _seconds(tp[2], fraction) if len(tp) > 2 else (0, 0)
         return _wall(
-            datetime(int(yyyy), int(mm), int(dd), hh, mi, ss), tz, clock)
+            datetime(int(yyyy), int(mm), int(dd), hh, mi, ss, us), tz, clock)
 
     # US date: "01/02/2020" or "01-02-2020" — wall clock, needs `tz`.
     m = _RE_US.match(s)
@@ -494,9 +681,9 @@ def parse_ts(date_str: str, time_str: str = "", tz: Optional[tzinfo] = None,
         tp = t.split(":") if t else ["0", "0", "0"]
         hh = int(tp[0]) if len(tp) > 0 else 0
         mi = int(tp[1]) if len(tp) > 1 else 0
-        ss = int(float(tp[2])) if len(tp) > 2 else 0
+        ss, us = _seconds(tp[2], fraction) if len(tp) > 2 else (0, 0)
         return _wall(
-            datetime(int(yyyy), int(mo), int(dd), hh, mi, ss), tz, clock)
+            datetime(int(yyyy), int(mo), int(dd), hh, mi, ss, us), tz, clock)
 
     # Unix timestamp (seconds or milliseconds)
     try:
@@ -512,7 +699,7 @@ def parse_ts(date_str: str, time_str: str = "", tz: Optional[tzinfo] = None,
     try:
         full = (s + " " + t).strip()
         had_zulu = full.endswith("Z")
-        dt = datetime.fromisoformat(full.rstrip("Z"))
+        dt = _iso_datetime(full.rstrip("Z"))
         if had_zulu:
             return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
         if dt.tzinfo is not None:
@@ -1071,21 +1258,54 @@ def counts_summary(stats: Optional[Dict[str, int]], tick_payload: bool = False) 
 # =============================================================================
 # Tick aggregator
 # =============================================================================
+def _in_time_order(ticks: List[Dict]) -> List[Dict]:
+    """`ticks` in time order. Ticks sharing a millisecond keep their file order
+    (Python's sort is stable), because nothing else says which came first. A
+    list that already ascends is returned as it is, without a copy."""
+    prev = None
+    for tick in ticks:
+        ts = tick["ts"]
+        if prev is not None and ts < prev:
+            return sorted(ticks, key=lambda t: t["ts"])
+        prev = ts
+    return ticks
+
+
 def aggregate_ticks(ticks: List[Dict], tf_min: int) -> List[Bar]:
-    """(ts_ms, bid, ask) ticks -> OHLCV bars."""
+    """(ts_ms, bid, ask) ticks -> bars, one per `tf_min` minutes on the UTC grid.
+
+    The rule, the same as the BAR6 format description and the backtest engine's
+    own tick loop:
+
+      ts          the bar's open time: tick time rounded down to the interval
+      open        mid price, (bid + ask) / 2, of the bar's earliest tick
+      high, low   the highest and lowest mid price of the bar's ticks
+      close       mid price of the bar's latest tick
+      bid, ask    the quote of the bar's latest tick
+
+    "Earliest" and "latest" are in TIME order, not in the order the rows sit in
+    the source: the ticks are sorted by time first. A position in a file is not
+    a time, so a shuffled export gives the same bars as a sorted one. Ticks with
+    the same millisecond keep their file order.
+
+    High and low are mid prices because every other price of the bar is one.
+    A stop or target is tested against them and the spread is paid once, when
+    the order fills, at the bar's bid or ask; a high taken from the ask would
+    reach a long's target half a spread before the mid did.
+    """
     interval_ms = tf_min * 60 * 1000
     bar_map: Dict[int, Bar] = {}
-    for tick in ticks:
+    for tick in _in_time_order(ticks):
         ts, bid, ask = tick["ts"], tick["bid"], tick["ask"]
         mid = (bid + ask) / 2.0
         bar_ts = (ts // interval_ms) * interval_ms
-        if bar_ts not in bar_map:
-            bar_map[bar_ts] = {"ts": bar_ts, "open": mid, "high": ask,
-                               "low": bid, "close": mid, "bid": bid, "ask": ask}
+        b = bar_map.get(bar_ts)
+        if b is None:
+            bar_map[bar_ts] = {"ts": bar_ts, "open": mid, "high": mid,
+                               "low": mid, "close": mid, "bid": bid, "ask": ask}
         else:
-            b = bar_map[bar_ts]
-            if ask > b["high"]:  b["high"] = ask
-            if bid < b["low"]:   b["low"]  = bid
+            if mid > b["high"]:  b["high"] = mid
+            if mid < b["low"]:   b["low"]  = mid
             b["close"] = mid
             b["bid"]   = bid
             b["ask"]   = ask
@@ -1097,6 +1317,11 @@ def aggregate_ticks(ticks: List[Dict], tf_min: int) -> List[Bar]:
 # =============================================================================
 def _auto_delim(sample: str) -> str:
     return max(",", "\t", ";", key=sample.count)
+
+
+#: First cells that mark a Dukascopy tick CSV's first row as its header.
+_DUKASCOPY_TIME_HEADERS = ("localtime", "local time", "local", "gmt time", "gmt", "utc",
+                           "date", "time", "timestamp")
 
 
 def parse_dukascopy(path: str, tf_min: int, progress: ProgressFn = None,
@@ -1120,12 +1345,23 @@ def parse_dukascopy(path: str, tf_min: int, progress: ProgressFn = None,
 
 
 def parse_dukascopy_ticks(path: str, progress: ProgressFn = None,
-                          stats: Optional[Dict[str, int]] = None) -> List[Dict]:
+                          stats: Optional[Dict[str, int]] = None,
+                          tz: Optional[tzinfo] = None) -> List[Dict]:
     """Parse Dukascopy tick CSV and return raw tick list [{ts, bid, ask}, ].
 
-    The ticks are returned in ARRIVAL order -- this parser has never
-    sorted, and does not start now. The counts are still taken, so a shuffled
-    tick export is reported rather than silently written out of order.
+    `tz` is accepted so every tick parser takes the same arguments, and never
+    used: a Dukascopy time is UTC or carries its own offset (TZ_POLICY).
+
+    The ticks are returned in ARRIVAL order. The raw tick path writes them as
+    they are and refuses a file that goes back in time; the bar path sorts them
+    by time before it aggregates (see aggregate_ticks). The counts are taken
+    either way, so a shuffled tick export is reported.
+
+    A first row whose first cell names the time column is a header, not an
+    unreadable row: "LocalTime", "Local time", "Local" and "Gmt time"
+    (Dukascopy's own exports and the sample in testcsvs/), "UTC" (the header
+    of a tick download stamped in UTC), and the generic "Date", "Time",
+    "Timestamp".
     """
     ticks: List[Dict] = []
     skipped = 0
@@ -1134,7 +1370,7 @@ def parse_dukascopy_ticks(path: str, progress: ProgressFn = None,
         for i, row in enumerate(reader):
             if not row:
                 continue
-            if i == 0 and row[0].strip().lower() in ("localtime", "date", "time", "timestamp"):
+            if i == 0 and row[0].strip().lower() in _DUKASCOPY_TIME_HEADERS:
                 continue
             if len(row) < 3:
                 skipped += 1
@@ -1158,13 +1394,310 @@ def parse_dukascopy_ticks(path: str, progress: ProgressFn = None,
     return ticks
 
 
+# ── Tick exports of other platforms ──────────────────────────────────────────
+#
+# Every tick parser returns [{ts, bid, ask}] in ARRIVAL order, like the
+# Dukascopy one: the raw tick path refuses a file that goes back in time, the
+# bar path sorts before it aggregates. The quote of each tick is the export's
+# own bid and ask, so the spread a backtest pays on these ticks, and on the bars
+# made from them, is the one the source quoted.
+#
+# A row may carry one side only. MT5 writes a tick row when the bid OR the ask
+# changed and leaves the other field empty; the side that did not change is
+# still quoted, so it is carried forward from the row before. A row carrying no
+# quote at all (an exchange symbol's trade) keeps the current quote. Rows before
+# both sides have been quoted once cannot be priced; they are counted as skipped.
+
+def _quote_side(field: str, current: Optional[float]) -> Optional[float]:
+    """The new value of one side of the quote: the field when it holds one,
+    else the side's current value (an empty field means "unchanged")."""
+    field = field.strip()
+    return float(field) if field else current
+
+
+class _QuoteTape:
+    """One file's ticks, built row by row with the quote carried forward."""
+
+    def __init__(self, stats):
+        self.ticks: List[Dict] = []
+        self.skipped = 0
+        self.unpriced = 0         # rows before the first complete quote
+        self.bid: Optional[float] = None
+        self.ask: Optional[float] = None
+        self._stats = stats
+
+    def add(self, ts: int, bid_field: str, ask_field: str, line: int) -> None:
+        """Add one row: `ts` (0 when its time could not be read) and its two
+        quote fields as written in the file."""
+        if not ts:
+            self.skipped += 1
+            return
+        try:
+            bid = _quote_side(bid_field, self.bid)
+            ask = _quote_side(ask_field, self.ask)
+        except ValueError:
+            self.skipped += 1
+            return
+        self.bid, self.ask = bid, ask
+        if bid is None or ask is None:
+            self.skipped += 1
+            self.unpriced += 1
+            return
+        self.ticks.append({"ts": ts, "bid": bid, "ask": ask})
+        _audit(self._stats, self.ticks[-1], line, tick=True)
+
+    def finish(self, path: str, what: str, clock: SourceClock,
+               progress: ProgressFn) -> List[Dict]:
+        clock.refuse_nonexistent(path)
+        _record(self._stats, self.ticks, self.skipped, clock)
+        if progress:
+            progress(f"  Loaded {len(self.ticks):,} {what} ticks "
+                     f"({self.skipped:,} skipped)")
+            if self.unpriced:
+                progress(f"  {self.unpriced:,} of the skipped rows came before the "
+                         f"file had quoted both a bid and an ask")
+        return self.ticks
+
+
+def _header_index(hdrs: List[str], *names: str) -> int:
+    """The column whose header is one of `names` exactly, else the first whose
+    header has one of them as a WORD ("transaction_time", "Gmt time"), trying
+    `names` in order; -1 when none does. A word, not a substring: "update_id"
+    holds "date" and is no time."""
+    for n in names:
+        for ci, h in enumerate(hdrs):
+            if h == n:
+                return ci
+        for ci, h in enumerate(hdrs):
+            if n in re.split(r"[^a-z0-9]+", h):
+                return ci
+    return -1
+
+
+#: Header words that mark a size, not a price: "Bid Volume", "best_bid_qty".
+_NOT_A_PRICE = ("vol", "size", "qty", "quantity", "amount", "count")
+
+
+def _quote_column(hdrs: List[str], side: str) -> int:
+    """The column holding the `side` ("bid" or "ask") price, by its header:
+    exactly "bid", else one containing "bid" that does not name a size."""
+    for ci, h in enumerate(hdrs):
+        if h == side:
+            return ci
+    for ci, h in enumerate(hdrs):
+        if side in h and not any(w in h for w in _NOT_A_PRICE):
+            return ci
+    return -1
+
+
+def parse_mt5_ticks(path: str, progress: ProgressFn = None,
+                    tz: Optional[tzinfo] = None,
+                    stats: Optional[Dict[str, int]] = None) -> List[Dict]:
+    """MetaTrader 5 tick export (Symbols, Ticks, Export ticks):
+
+      <DATE>	<TIME>	<BID>	<ASK>	<LAST>	<VOLUME>	<FLAGS>
+      2024.01.02	00:00:12.108	1.10427	1.10481			6
+      2024.01.02	00:00:14.513	1.10425				2
+
+    Tab separated (a comma or semicolon is read too). The time is the broker's
+    server clock with milliseconds, so --tz is required. A row whose BID or ASK
+    is empty did not change that side; the side keeps its last value. Columns
+    are found by their header names; a file without the header is read in the
+    export's order (date, time, bid, ask).
+    """
+    tape = _QuoteTape(stats)
+    clock = SourceClock(tz, repeats=True)       # ticks: see SourceClock, TICKS
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        sample = f.read(8192)
+        f.seek(0)
+        reader = csv.reader(f, delimiter=_auto_delim(sample))
+        cols = None
+        for raw in reader:
+            row = [c.strip().strip("<>\"") for c in raw]
+            if not any(row):
+                continue
+            if cols is None:
+                hdrs = [h.upper() for h in row]
+                cols = (0, 1, 2, 3)
+                if "BID" in hdrs and "ASK" in hdrs:
+                    cols = (hdrs.index("DATE") if "DATE" in hdrs else 0,
+                            hdrs.index("TIME") if "TIME" in hdrs else -1,
+                            hdrs.index("BID"), hdrs.index("ASK"))
+                    continue
+            d, t, b, a = cols
+            try:
+                ts = parse_ts(row[d], row[t] if 0 <= t < len(row) else "", tz, clock,
+                              fraction=True)
+            except (ValueError, IndexError):
+                ts = 0
+            tape.add(ts, row[b] if b < len(row) else "", row[a] if a < len(row) else "",
+                     reader.line_num)
+    return tape.finish(path, "MT5", clock, progress)
+
+
+#: A NinjaTrader tick stamp: date, time and the fraction in 100 ns steps.
+_RE_NT_TICK = re.compile(r"^(\d{8}) (\d{6})(?: (\d{1,7}))?$")
+
+
+def parse_ninjatrader_ticks(path: str, progress: ProgressFn = None,
+                            tz: Optional[tzinfo] = None,
+                            stats: Optional[Dict[str, int]] = None) -> List[Dict]:
+    """NinjaTrader 8 tick export (Tools, Historical Data, Export, type Tick):
+
+      20240102 070000 1230000;16860.75;16860.50;16861.00;1
+
+    The stamp, then the last price, the bid, the ask and the volume, separated
+    by ; (or ,). The fraction is in 100-nanosecond steps (1230000 = 0.123 s).
+    The time is the zone set in NinjaTrader, so --tz is required.
+    """
+    tape = _QuoteTape(stats)
+    clock = SourceClock(tz, repeats=True)       # ticks: see SourceClock, TICKS
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        sample = f.read(2048)
+        f.seek(0)
+        delim = ";" if sample.count(";") >= sample.count(",") else ","
+        reader = csv.reader(f, delimiter=delim)
+        for i, raw in enumerate(reader):
+            row = [c.strip() for c in raw]
+            if not any(row) or (i == 0 and not row[0][:1].isdigit()):
+                continue
+            m = _RE_NT_TICK.match(row[0]) if len(row) >= 4 else None
+            ts = 0
+            if m:
+                d, ti, frac = m.groups()
+                try:
+                    ts = _wall(datetime(int(d[:4]), int(d[4:6]), int(d[6:8]),
+                                        int(ti[:2]), int(ti[2:4]), int(ti[4:6]),
+                                        int((frac or "").ljust(7, "0")[:6])),
+                               tz, clock)
+                except ValueError:
+                    ts = 0
+            tape.add(ts, row[2] if m else "", row[3] if m else "", reader.line_num)
+    return tape.finish(path, "NinjaTrader", clock, progress)
+
+
+def parse_generic_ticks(path: str, progress: ProgressFn = None,
+                        tz: Optional[tzinfo] = None,
+                        stats: Optional[Dict[str, int]] = None) -> List[Dict]:
+    """Any tick CSV whose header names a time, a bid and an ask column:
+
+      timestamp,bid,ask
+      2024-01-02 13:00:00.250,1.11160,1.11180
+
+    The bid column is the one headed "bid", else the first whose header
+    contains "bid" and names no size ("px_bid", "best_bid_price", but not
+    "Bid Volume"); the same for the ask. The time is the column headed "date",
+    "datetime", "timestamp" or "time" (or with one of them as a word of its
+    header, "transaction_time"), plus a separate "time" column when the date
+    stands alone. Any time spelling
+    DataConvert reads works, fractions of a second included; a wall clock needs
+    --tz, a Unix time in seconds or milliseconds is an instant already.
+    """
+    tape = _QuoteTape(stats)
+    clock = SourceClock(tz, repeats=True)       # ticks: see SourceClock, TICKS
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        sample = f.read(8192)
+        f.seek(0)
+        reader = csv.reader(f, delimiter=_auto_delim(sample))
+        cols = None
+        for raw in reader:
+            row = [c.strip().strip("\"<>") for c in raw]
+            if not any(row):
+                continue
+            if cols is None:
+                hdrs = [h.lower() for h in row]
+                d = _header_index(hdrs, "date", "datetime", "timestamp", "time")
+                t = _header_index(hdrs, "time")
+                b, a = _quote_column(hdrs, "bid"), _quote_column(hdrs, "ask")
+                if min(d, b, a) < 0:
+                    raise ValueError(
+                        "A tick CSV needs a header row naming its time, bid and ask "
+                        f"columns; this one has {row!r}")
+                cols = (d, t if t != d else -1, b, a)
+                continue
+            d, t, b, a = cols
+            try:
+                ts = parse_ts(row[d], row[t] if 0 <= t < len(row) else "", tz, clock,
+                              fraction=True)
+            except (ValueError, IndexError):
+                ts = 0
+            tape.add(ts, row[b] if b < len(row) else "", row[a] if a < len(row) else "",
+                     reader.line_num)
+    return tape.finish(path, "CSV", clock, progress)
+
+
+#: Every input format whose rows are quotes: its tick parser. These formats can
+#: write raw ticks (--ticks), and their bars keep the quoted spread.
+TICK_PARSERS: Dict[str, Callable[..., List[Dict]]] = {
+    "dukascopy":        parse_dukascopy_ticks,
+    "mt5ticks":         parse_mt5_ticks,
+    "ninjatraderticks": parse_ninjatrader_ticks,
+    "genericticks":     parse_generic_ticks,
+}
+
+
+def _bars_from_ticks(tick_parser: Callable[..., List[Dict]], what: str):
+    """The bar parser of a tick format: its ticks, aggregated (aggregate_ticks)."""
+    def parse(path: str, tf_min: int, progress: ProgressFn = None,
+              tz: Optional[tzinfo] = None,
+              stats: Optional[Dict[str, int]] = None) -> List[Bar]:
+        ticks = tick_parser(path, progress, tz=tz, stats=stats)
+        if progress:
+            progress(f"  Aggregating {len(ticks):,} ticks -> M{tf_min} bars")
+        return aggregate_ticks(ticks, tf_min)
+    parse.__name__ = f"parse_{what}_bars"
+    parse.__doc__ = f"{what} ticks aggregated into bars; see aggregate_ticks."
+    return parse
+
+
+parse_mt5_tick_bars = _bars_from_ticks(parse_mt5_ticks, "mt5ticks")
+parse_ninjatrader_tick_bars = _bars_from_ticks(parse_ninjatrader_ticks, "ninjatraderticks")
+parse_generic_tick_bars = _bars_from_ticks(parse_generic_ticks, "genericticks")
+
+
 def _make_bar(ts: int, o: float, h: float, l: float, c: float) -> Bar:
     return {"ts": ts, "open": o, "high": h, "low": l, "close": c, "bid": c, "ask": c}
 
 
+# ── A spread per bar (MT4/MT5) ───────────────────────────────────────────────
+#
+# MetaTrader's bar prices are BID prices, and its bar exports can carry one
+# spread per bar, in points: the CSV's <SPREAD> column, the .hst v401 record's
+# spread field. A point is the symbol's smallest price step, 10^-digits.
+#
+# The backtest reads every bar's open, high, low and close as MID prices and
+# takes the half-spread a fill pays from the bar's closing quote, ask - mid
+# (the engine's entry fill is open + (ask - mid) for a long). So a bar with a
+# spread is written the same way a bar made from ticks is:
+#
+#   open, high, low, close   the bid price plus half the bar's spread
+#   bid                      the close's bid, as exported
+#   ask                      that bid plus the spread
+#
+# One spread stands for the whole bar: the export gives no other. A bar whose
+# spread is 0 has bid = ask, which the backtest reads as "no quote", and it then
+# charges the spread it is configured with for that bar.
+
+def _decimals(field: str) -> int:
+    """How many digits follow the decimal point in a price as written."""
+    _, _, frac = field.strip().partition(".")
+    return len(frac) if frac.isdigit() else 0
+
+
+def _with_spread(bar: Bar, spread_price: float) -> Bar:
+    """`bar` (bid prices) with `spread_price` applied as described above."""
+    half = spread_price / 2.0
+    bid = bar["close"]
+    for k in ("open", "high", "low", "close"):
+        bar[k] += half
+    bar["bid"], bar["ask"] = bid, bid + spread_price
+    return bar
+
+
 def parse_mt4(path: str, tf_min: int, progress: ProgressFn = None,
               tz: Optional[tzinfo] = None,
-              stats: Optional[Dict[str, int]] = None) -> List[Bar]:
+              stats: Optional[Dict[str, int]] = None,
+              point: Optional[float] = None) -> List[Bar]:
     """
     MT4 / MT5 bar CSV:
       <DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<TICKVOL>,<VOL>,<SPREAD>
@@ -1172,8 +1705,17 @@ def parse_mt4(path: str, tf_min: int, progress: ProgressFn = None,
 
     Also handles MT5 (same layout, tab- or comma-delimited).
     Handles optional combined datetime column (no separate time col).
+
+    A header naming a SPREAD column keeps the bar's spread (see "A spread per
+    bar" above). The spread is in points; `point` is the price of one point.
+    Without it, the point is read from the prices: MetaTrader writes every
+    price with the symbol's digits, so the most decimals any price of the file
+    has are the digits (1.10427: five, a point of 0.00001). The log says which.
     """
     bars: List[Bar] = []
+    spreads: List[float] = []        # the SPREAD field of each bar, in points
+    lines: List[int] = []            # the source line of each bar
+    decimals = 0                     # the most decimals any price is written with
     skipped = 0
     clock = SourceClock(tz)          # one per FILE, read in row order
     with open(path, newline="", encoding="utf-8", errors="replace") as f:
@@ -1182,6 +1724,7 @@ def parse_mt4(path: str, tf_min: int, progress: ProgressFn = None,
         delim = _auto_delim(sample)
         reader = csv.reader(f, delimiter=delim)
         date_col, time_col, o_col, h_col, l_col, c_col = 0, 1, 2, 3, 4, 5
+        sp_col = -1
         for i, raw in enumerate(reader):
             row = [c.strip().strip("<>\"") for c in raw if raw]
             if not row:
@@ -1202,8 +1745,9 @@ def parse_mt4(path: str, tf_min: int, progress: ProgressFn = None,
                         elif h == "HIGH":   h_col    = ci
                         elif h == "LOW":    l_col    = ci
                         elif h == "CLOSE":  c_col    = ci
+                        elif h == "SPREAD": sp_col   = ci
                     continue
-            if len(row) <= max(o_col, h_col, l_col, c_col):
+            if len(row) <= max(o_col, h_col, l_col, c_col, sp_col):
                 skipped += 1
                 continue
             try:
@@ -1212,13 +1756,31 @@ def parse_mt4(path: str, tf_min: int, progress: ProgressFn = None,
                 if not ts:
                     skipped += 1
                     continue
-                bars.append(_make_bar(ts, float(row[o_col]), float(row[h_col]),
-                                      float(row[l_col]), float(row[c_col])))
-                _audit(stats, bars[-1], reader.line_num)
+                prices = [row[o_col], row[h_col], row[l_col], row[c_col]]
+                bar = _make_bar(ts, *(float(p) for p in prices))
+                if sp_col >= 0:
+                    spread = float(row[sp_col])
+                    if not spread >= 0:
+                        raise ValueError("a spread below zero")
+                    spreads.append(spread)
+                    decimals = max([decimals] + [_decimals(p) for p in prices])
+                bars.append(bar)
+                lines.append(reader.line_num)
             except (ValueError, IndexError):
                 skipped += 1
             if progress and i % 100_000 == 0 and i:
                 progress(f"  Parsed {i:,} rows")
+    if sp_col >= 0:
+        unit = point if point is not None else 10.0 ** -decimals
+        for bar, spread in zip(bars, spreads):
+            _with_spread(bar, spread * unit)
+        if progress:
+            progress(f"  Spread column kept: a point is {unit:g} "
+                     + ("(given)" if point is not None else
+                        f"({decimals} decimals in the prices)"))
+    # Checked as written: after the spread, which moves every price.
+    for bar, line in zip(bars, lines):
+        _audit(stats, bar, line)
     if progress:
         progress(f"  Loaded {len(bars):,} bars ({skipped:,} skipped)")
     clock.refuse_nonexistent(path)
@@ -1227,7 +1789,8 @@ def parse_mt4(path: str, tf_min: int, progress: ProgressFn = None,
 
 def parse_mt4hst(path: str, tf_min: int, progress: ProgressFn = None,
                  tz: Optional[tzinfo] = None,
-                 stats: Optional[Dict[str, int]] = None) -> List[Bar]:
+                 stats: Optional[Dict[str, int]] = None,
+                 point: Optional[float] = None) -> List[Bar]:
     """
     MetaTrader 4 binary .hst history file.
     Version 400: 148-byte header + 44-byte records  {time(u32), open, low, high, close, vol  (5xf64)}
@@ -1242,6 +1805,11 @@ def parse_mt4hst(path: str, tf_min: int, progress: ProgressFn = None,
     as reading an MT4 CSV's wall clock as UTC, which is why "mt4hst" is a
     "wall" format in TZ_POLICY and gets the same --tz treatment: decode to the
     naive wall clock first, then anchor it with `tz`.
+
+    A v401 record's spread (in points) is kept (see "A spread per bar"); the
+    header's digits field (offset 84) gives the point, 10^-digits, unless
+    `point` is given. Header: version(4) copyright(64) symbol(12) period(4)
+    digits(4) timesign(4) last_sync(4) unused(52).
     """
     HST_HDR = 148
     with open(path, "rb") as f:
@@ -1274,11 +1842,22 @@ def parse_mt4hst(path: str, tf_min: int, progress: ProgressFn = None,
             _audit(stats, bars[-1], i + 1, unit="record")
     else:  # 401
         # CTM(int64) OPEN HIGH LOW CLOSE  tick_vol(uint64) spread(int32) real_vol(uint64)
+        digits = struct.unpack_from("<i", raw, 84)[0]
+        unit = point if point is not None else (
+            10.0 ** -digits if 0 <= digits <= 10 else None)
+        if progress:
+            progress("  Spread field kept: a point is %g (%s)" % (
+                unit, "given" if point is not None else "%d digits in the header" % digits)
+                if unit is not None else
+                "  Spread field NOT kept: the header's digits (%d) is not a number "
+                "of decimals; give the point to keep it" % digits)
         FMT, SZ = "<qddddQiQ", 60
         n = len(data) // SZ
         for i in range(n):
-            time_s, o, high, low, c, _tv, _sp, _rv = struct.unpack_from(FMT, data, i * SZ)
+            time_s, o, high, low, c, _tv, sp, _rv = struct.unpack_from(FMT, data, i * SZ)
             bars.append(_make_bar(_ctm_to_utc_ms(time_s), o, high, low, c))
+            if unit is not None and sp > 0:
+                _with_spread(bars[-1], sp * unit)
             _audit(stats, bars[-1], i + 1, unit="record")
 
     if progress:
@@ -1329,9 +1908,17 @@ def parse_ninjatrader(path: str, tf_min: int, progress: ProgressFn = None,
     """
     NinjaTrader bar export (several layouts):
       20200102 070500;11430;11439;11428;11430;100          (compact yyyymmdd hhmmss)
+      20200102;070500;11430;11439;11428;11430;100          (date and time in two fields)
       01/02/2020 07:05:00;11430;11439;11428;11430;100      (US date)
       2020-01-02 07:05:00;11430;11439;11428;11430;100      (ISO date)
+      20200102;11430;11439;11428;11430;100                 (daily bar: the date alone)
     Separator: ; or ,   |   OHLCV order: open, high, low, close
+
+    A row of exactly six fields whose first field is a bare yyyymmdd date is a
+    DAILY bar (date;open;high;low;close;volume): NinjaTrader writes no time for
+    it. Its time is 00:00 of that date in the source timezone (--tz). The date
+    and the time in two fields always has seven, so the two never meet; and a
+    six-digit open (123000.5) is a price, never a time.
     """
     bars: List[Bar] = []
     skipped = 0
@@ -1353,13 +1940,19 @@ def parse_ninjatrader(path: str, tf_min: int, progress: ProgressFn = None,
                 if " " in row[0]:
                     parts = row[0].split(" ", 1)
                     ts = parse_ts(parts[0], parts[1], tz, clock)
+                    ci = 1          # OHLCV after the combined stamp
+                elif len(row) == 6 and _RE_NT_DATE.match(row[0]):
+                    # A daily bar: the date alone, then OHLCV. Its time is
+                    # the start of that date in the source zone.
+                    d = row[0]
+                    ts = _wall(datetime(int(d[:4]), int(d[4:6]), int(d[6:8])), tz, clock)
+                    ci = 1
                 else:
                     ts = parse_ts(row[0], row[1] if len(row) > 5 else "", tz, clock)
+                    ci = 2          # OHLCV after the date and the time
                 if not ts:
                     skipped += 1
                     continue
-                # OHLCV starts at col 1 if datetime combined, else col 2
-                ci = 1 if " " in row[0] else 2
                 bars.append(_make_bar(ts, float(row[ci]), float(row[ci+1]),
                                       float(row[ci+2]), float(row[ci+3])))
                 _audit(stats, bars[-1], reader.line_num)
@@ -1683,16 +2276,24 @@ def parse_generic(path: str, tf_min: int, progress: ProgressFn = None,
 # =============================================================================
 FORMATS: Dict[str, tuple] = {
     "dukascopy":    (parse_dukascopy,    "Dukascopy tick CSV  (LocalTime,Ask,Bid,AskVolume,BidVolume)"),
-    "mt4":          (parse_mt4,          "MT4 bar CSV  (<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,...)"),
+    "mt5ticks":     (parse_mt5_tick_bars, "MT5 tick export  (<DATE> <TIME> <BID> <ASK> <LAST> <VOLUME> <FLAGS>)"),
+    "ninjatraderticks": (parse_ninjatrader_tick_bars,
+                     "NinjaTrader tick export  (yyyyMMdd HHmmss fffffff;last;bid;ask;volume)"),
+    "genericticks": (parse_generic_tick_bars, "Any tick CSV with a header naming a time, a bid and an ask column"),
+    "mt4":          (parse_mt4,          "MT4 bar CSV  (<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,...,<SPREAD>)"),
     "mt4hst":       (parse_mt4hst,       "MT4 .hst binary history  (v400: 44-byte, v401: 60-byte records)"),
     "mt5":          (parse_mt4,          "MT5 bar CSV  (same layout as MT4, tab or comma delimited)"),
     "tradingview":  (parse_tradingview,  "TradingView export  (time,open,high,low,close,volume)"),
-    "ninjatrader":  (parse_ninjatrader,  "NinjaTrader bar CSV  (yyyymmdd hhmmss or date+time ; sep)"),
+    "ninjatrader":  (parse_ninjatrader,  "NinjaTrader bar CSV  (yyyymmdd hhmmss or date+time, or a daily yyyymmdd ; sep)"),
     "tradestation": (parse_tradestation, "TradeStation bar CSV  (Date,Time,Open,High,Low,Close,...)"),
     "binance":      (parse_binance,      "Binance klines CSV  (data.binance.vision, 12 columns, ms timestamps)"),
     "bybit":        (parse_bybit,        "Bybit / Kraken / Coinbase OHLCV CSV  (Unix seconds, open_time header)"),
     "generic":      (parse_generic,      "Auto-detect any OHLCV CSV  (column names or positional)"),
 }
+
+#: The bar formats that can carry one spread per bar, in points (see "A spread
+#: per bar"): the MT4/MT5 CSV's SPREAD column and the .hst v401 spread field.
+SPREAD_FORMATS = ("mt4", "mt5", "mt4hst")
 
 
 def detect_format(path: str) -> str:
@@ -1720,13 +2321,28 @@ def detect_format(path: str) -> str:
 
         if "localtime" in sample or re.search(r"\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2}\.\d+", sample):
             return "dukascopy"
+        # An MT5 tick export: the bar export's <DATE> header with <BID> and <ASK>.
+        if "<bid>" in sample and "<ask>" in sample:
+            return "mt5ticks"
         if "<date>" in sample or "<open>" in sample:
             return "mt4"
+        # A NinjaTrader tick export: the compact stamp with a seven-digit fraction.
+        if re.search(r"\d{8} \d{6} \d{7}[;,]", sample):
+            return "ninjatraderticks"
+        # A header naming a bid and an ask column and no open or close: quotes.
+        head = [h.strip().strip("\"<>") for h in re.split(r"[,;\t]", lines[0].lower())]
+        if (_quote_column(head, "bid") >= 0 and _quote_column(head, "ask") >= 0
+                and not any(h in ("open", "close") for h in head)):
+            return "genericticks"
         # TradingView: first column is "time" (Unix seconds), no separate "date" column
         if (re.search(r"time,open,high,low,close", sample.replace(" ", ""))
                 and not re.search(r"\bdate\b", sample[:200].lower())):
             return "tradingview"
         if re.search(r"\d{8} \d{6}", sample):
+            return "ninjatrader"
+        # A NinjaTrader daily export: yyyymmdd;open;high;low;close;volume.
+        if any(re.match(r"\d{8}[;,]", ln) and len(re.split(r"[;,]", ln.strip())) == 6
+               for ln in lines):
             return "ninjatrader"
         if re.search(r'"date".*"time".*"open"', sample):
             return "tradestation"
@@ -1776,19 +2392,157 @@ def _refuse_audited_with_counts(stats, output_path: str, progress: ProgressFn,
         raise
 
 
+# ── Memory a conversion needs ───────────────────────────────────────────────
+#
+# Every parser holds all rows of the input in memory before anything is
+# written (sorting by time needs the whole list). Measured with Python 3.13 on
+# Dukascopy tick files of half a million, one and two million rows, for bar and
+# tick output alike: about 313 MB per million rows, on top of about 20 MB for
+# Python itself, roughly 13 times the size of a tick CSV. A year of EUR-USD
+# ticks (about 28 million rows) needs about 8.6 GB, a year of BTC ticks (about
+# 47 million) about 15 GB. MB and GB here are 10^6 and 10^9 bytes.
+MEMORY_MB_PER_MILLION_ROWS = 313
+MEMORY_BASE_MB = 20
+_ROW_SAMPLE_BYTES = 1 << 20      # the first MiB of a text file gives its mean row length
+
+
+class NotEnoughMemory(Exception):
+    """The input needs more memory to convert than the computer has available.
+
+    Raised before the input is parsed, so nothing is written. Carries `rows`,
+    `need_mb`, `available_mb` and `reason`: the message without the
+    command-line switch, for the GUI, which asks "Convert anyway?" instead.
+    """
+
+    def __init__(self, rows: int, need_mb: float, available_mb: float):
+        self.rows, self.need_mb, self.available_mb = rows, need_mb, available_mb
+        reason = (
+            f"This file has about {rows:,} rows. Converting it needs about "
+            f"{memory_text(need_mb)} of memory, and about {memory_text(available_mb)} "
+            f"is available on this computer. DataConvert holds every row in memory "
+            f"while it converts (about {MEMORY_MB_PER_MILLION_ROWS} MB per million "
+            f"rows), so the conversion would run out of memory before it ends. A file "
+            f"that covers a shorter period needs less")
+        self.reason = reason + "."
+        super().__init__(reason + "; --ignore-memory-check starts the conversion anyway.")
+
+
+def memory_text(mb: float) -> str:
+    """'640 MB' or '8.6 GB'."""
+    return f"{mb / 1000:.1f} GB" if mb >= 1000 else f"{mb:.0f} MB"
+
+
+def memory_estimate_mb(rows: int) -> float:
+    """The memory a conversion of `rows` rows needs, in MB (measured, see above)."""
+    return MEMORY_BASE_MB + MEMORY_MB_PER_MILLION_ROWS * rows / 1_000_000
+
+
+def _rows_in_text(size: int, head: bytes) -> int:
+    """Rows of a text file of `size` bytes whose first bytes are `head`:
+    counted when `head` is the whole file, else estimated from the mean
+    length of its complete rows (the sample's last row is usually cut)."""
+    if not head:
+        return 0
+    lines = head.count(b"\n")
+    if len(head) >= size:
+        return lines + (0 if head.endswith(b"\n") else 1)
+    if not lines:
+        return 1
+    return round(size * lines / (head.rindex(b"\n") + 1))
+
+
+def estimate_rows(path: str, fmt: str) -> int:
+    """About how many rows `path` holds, without reading more than a sample:
+    an MT4 .hst file from its record size, a ZIP from its largest member's
+    uncompressed size, a text file from the length of its first rows."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        head = f.read(_ROW_SAMPLE_BYTES)
+    if fmt == "mt4hst" and len(head) >= 4:
+        version = struct.unpack_from("<I", head, 0)[0]
+        record = 60 if version == 401 else 44
+        return max(0, (size - 148) // record)
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as z:
+            members = [i for i in z.infolist() if not i.is_dir()]
+            if not members:
+                return 0
+            biggest = max(members, key=lambda i: i.file_size)
+            with z.open(biggest) as f:
+                return _rows_in_text(biggest.file_size, f.read(_ROW_SAMPLE_BYTES))
+    return _rows_in_text(size, head)
+
+
+def available_memory_mb() -> Optional[float]:
+    """The physical memory available to a new process now, in MB, or None
+    where it cannot be read (then the estimate is reported, not enforced)."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class _MemoryStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            status = _MemoryStatus()
+            status.dwLength = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return status.ullAvailPhys / 1_000_000
+            return None
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024 / 1_000_000
+    except (OSError, ValueError, AttributeError):
+        return None
+    return None
+
+
+def check_memory(input_path: str, fmt: str, progress: ProgressFn = None,
+                 ignore: bool = False) -> Tuple[int, float, Optional[float]]:
+    """Estimate the memory the conversion needs and say it; raise
+    NotEnoughMemory when it is more than is available (unless `ignore`).
+    Returns (rows, need_mb, available_mb)."""
+    rows = estimate_rows(input_path, fmt)
+    need = memory_estimate_mb(rows)
+    available = available_memory_mb()
+    if progress:
+        progress(f"Memory: about {rows:,} rows, about {memory_text(need)} needed to convert"
+                 + (f" ({memory_text(available)} available)" if available is not None else ""))
+    if available is not None and need > available and not ignore:
+        raise NotEnoughMemory(rows, need, available)
+    return rows, need, available
+
+
 def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
             fmt: Optional[str] = None, progress: ProgressFn = None,
             as_ticks: bool = False,
             col_map: Optional[Dict[str, int]] = None,
-            tz: Optional[str] = None) -> dict:
+            tz: Optional[str] = None,
+            ignore_memory_check: bool = False,
+            point: Optional[float] = None) -> dict:
     """Convert input_path -> BAR6 output_path.
 
-    as_ticks=True: write raw ticks (payload_type=1, 32-byte TickRecord).
+    as_ticks=True: write raw ticks (payload_type=1, 32-byte TickRecord), for
+             the formats in TICK_PARSERS.
+    point: the price of one point of an MT4/MT5 spread (mt4, mt5, mt4hst);
+           without it the point is read from the file (see parse_mt4,
+           parse_mt4hst). Refused for the other formats, which have no spread
+           column it could apply to.
     col_map: manual column index mapping for generic CSVs,
              e.g. {'date': 0, 'time': 1, 'open': 2, 'high': 3, 'low': 4, 'close': 5}
     tz: source timezone for formats that store a bare wall clock.
         An IANA name or a fixed offset. Required for those formats, refused
         for the ones whose timestamps already fix an instant.
+    ignore_memory_check: convert even when the estimated memory need is
+        more than is available (see check_memory). Without it such an input
+        raises NotEnoughMemory before it is parsed.
 
     The returned dict carries `rows_parsed`, `skipped_rows`,
     `out_of_order_rows`, `duplicate_timestamps` and `dst_repeated_rows` on
@@ -1827,21 +2581,34 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
     # that cannot be timestamped correctly stops here instead of producing a
     # file full of plausible, silently-shifted bars.
     source_tz = require_tz(fmt, resolve_tz(tz))
+    if point is not None:
+        if fmt not in SPREAD_FORMATS:
+            raise ValueError(
+                f"A point applies to the spread column of {', '.join(SPREAD_FORMATS)} "
+                f"exports; format {fmt!r} has no spread column.")
+        if not (point > 0 and math.isfinite(point)):
+            raise ValueError(f"A point is a price step above zero; got {point!r}.")
+    # The memory the parse will need, said before it starts, and refused when
+    # the computer does not have it: an out-of-memory error after a long run
+    # tells the user nothing they could have acted on.
+    check_memory(input_path, fmt, progress, ignore=ignore_memory_check)
     stats = new_conversion_counts()
     if progress and source_tz is not None:
-        progress(f"Source timezone: {tz} (timestamps converted to UTC on import)")
+        carried = (f"zone rules carried by DataConvert, IANA {ZONES_VERSION}; "
+                   if is_carried(source_tz) else "")
+        progress(f"Source timezone: {tz} ({carried}timestamps converted to UTC on import)")
 
     # Tick output path
     if as_ticks:
-        if fmt not in ("dukascopy",):
+        if fmt not in TICK_PARSERS:
             raise ValueError(
-                f"--ticks / 'Save as ticks' is only supported for tick-based input formats "
-                f"(currently: dukascopy). Got: {fmt!r}. "
-                f"Bar-based formats do not carry per-tick bid/ask data."
+                f"Raw ticks can only be written from a tick format "
+                f"({', '.join(TICK_PARSERS)}). Got: {fmt!r}. "
+                f"A bar format does not carry a bid and an ask per tick."
             )
         if progress:
             progress(f"Parsing {os.path.basename(input_path)} as [{fmt}] (raw ticks)")
-        ticks = parse_dukascopy_ticks(input_path, progress, stats=stats)
+        ticks = TICK_PARSERS[fmt](input_path, progress, tz=source_tz, stats=stats)
         if not ticks:
             raise ValueError("No ticks could be parsed from the input file")
         _refuse_audited_with_counts(stats, output_path, progress, tick_payload=True)
@@ -1884,6 +2651,9 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
     if col_map and fmt in ("generic", None):
         bars = parse_generic(input_path, tf_min, progress, col_map=col_map,
                              tz=source_tz, stats=stats)
+    elif fmt in SPREAD_FORMATS:
+        bars = parser_fn(input_path, tf_min, progress, tz=source_tz, stats=stats,
+                         point=point)
     else:
         bars = parser_fn(input_path, tf_min, progress, tz=source_tz, stats=stats)
     if not bars:
@@ -1937,8 +2707,11 @@ def cmd_info(path: str) -> None:
     """Print a .bin file's header.
 
     Raises OSError when the file cannot be read, and NotABarFile when it is
-    shorter than the header its magic announces; main() reports either as a
-    one-line error rather than a traceback.
+    shorter than the header its magic announces, when a BAR6 header names a
+    version or a payload type this tool does not know, or when the file's size
+    does not match the records its header states (the header is printed
+    first, then the sentence); main() reports either as a one-line error
+    rather than a traceback. Reads the header only, never more.
     """
     with open(path, "rb") as f:
         raw = f.read(max(HDR_V2_SIZE, _HDR_V1_SIZE))
@@ -1955,21 +2728,39 @@ def cmd_info(path: str) -> None:
 
     if magic == MAGIC_V2:
         mg, ver, pt, tf, count, ts0, ts1, sym_b = struct.unpack_from(HDR_V2_FMT, raw)
+        # The header is only meaningful in the version and payload this tool
+        # writes. Anything else is said in one sentence, before a single field
+        # of it is shown as if it could be read.
+        if ver != FORMAT_VERSION:
+            raise NotABarFile(f"{path} is a BAR6 file of version {ver}; this tool "
+                              f"reads version {FORMAT_VERSION} only, so its header "
+                              f"cannot be read")
+        if pt not in (PAYLOAD_BARS, PAYLOAD_TICKS):
+            raise NotABarFile(f"{path} is a BAR6 file with payload type {pt}; "
+                              f"only {PAYLOAD_BARS} (bars) and {PAYLOAD_TICKS} "
+                              f"(ticks) exist, so its records cannot be read")
         sym = sym_b.rstrip(b"\x00").decode("ascii", errors="replace")
         rec_size = TICK_SIZE if pt == PAYLOAD_TICKS else BAR_SIZE
         print(f"File:        {path}")
         print(f"Format:      BAR6")
+        print(f"Version:     {ver}")
         print(f"Symbol:      {sym or '(empty)'}")
         print(f"Payload:     {'ticks (type=1, 32 B)' if pt == PAYLOAD_TICKS else 'bars (type=0, 56 B)'}")
         print(f"Timeframe:   {'tick (M0)' if tf == 0 else f'M{tf}'}")
         print(f"Records:     {count:,}")
         print(f"Start:       {ts_to_str(ts0)}")
         print(f"End:         {ts_to_str(ts1)}")
-        print(f"Payload:     {'bars' if pt == 0 else 'ticks'}")
         expected = HDR_V2_SIZE + count * rec_size
         actual   = os.path.getsize(path)
         ok = "OK" if actual == expected else f"MISMATCH (expected {expected:,}, got {actual:,})"
         print(f"File size:   {actual:,} bytes  {ok}")
+        if actual != expected:
+            whole = max(actual - HDR_V2_SIZE, 0) // rec_size
+            raise NotABarFile(
+                f"{path} does not hold the records its header states: the header "
+                f"names {count:,} record(s) of {rec_size} bytes, the file holds "
+                f"{whole:,} whole record(s) and {actual:,} bytes in all. It was cut "
+                f"short or changed after it was written; convert the source data again")
     elif magic == MAGIC_V1:
         mg, ver, tf, count, ts0, ts1 = struct.unpack_from(_HDR_V1_FMT, raw)
         print(f"File:        {path}")
@@ -2307,6 +3098,14 @@ def run_gui() -> None:
     ttk.Combobox(tf_frame, textvariable=v_tf,
                  values=[str(t) for t in TIMEFRAMES], width=8).pack(ipady=2)
 
+    # The price of one point of an MT4/MT5 spread column. Empty: read from the
+    # file (the .hst header's digits, or the decimals of the CSV's prices).
+    v_point = tk.StringVar(value="")
+    point_frame = tk.Frame(r2, bg=C["bg"])
+    point_frame.grid(row=0, column=2, sticky="w", padx=(12, 0))
+    lbl(point_frame, "Spread point (optional)")
+    entry_widget(point_frame, v_point, width=10).pack(ipady=4)
+
     # Output file
     lbl(main, "Output File", pady=(0, 0))
     out_row = tk.Frame(main, bg=C["bg"])
@@ -2321,7 +3120,7 @@ def run_gui() -> None:
     ticks_row = tk.Frame(main, bg=C["bg"])
     ticks_row.pack(fill="x", pady=(0, 8))
     ticks_chk = tk.Checkbutton(
-        ticks_row, text="Save as raw ticks  (payload_type=1, 32 B/tick - Dukascopy only)",
+        ticks_row, text="Save as raw ticks  (payload_type=1, 32 B/tick - tick formats only)",
         variable=v_as_ticks, bg=C["bg"], fg=C["text"],
         activebackground=C["bg"], activeforeground=C["accent"],
         selectcolor=C["surf2"], font=(C["ui"][0], 8),
@@ -2348,8 +3147,7 @@ def run_gui() -> None:
     def _update_ticks_state(*_):
         """Disable tick checkbox for bar-only formats."""
         fmt = v_format.get()
-        tick_formats = {"dukascopy", "auto"}
-        if fmt in tick_formats:
+        if fmt == "auto" or fmt in TICK_PARSERS:
             ticks_chk.configure(state="normal")
         else:
             v_as_ticks.set(False)
@@ -2449,6 +3247,13 @@ def run_gui() -> None:
         if not inp:  messagebox.showerror("Error", "No input file selected"); return
         if not out:  messagebox.showerror("Error", "No output file specified"); return
         if not sym:  messagebox.showerror("Error", "Symbol name is required"); return
+        point = None
+        if v_point.get().strip():
+            try:
+                point = float(v_point.get().strip())
+            except ValueError:
+                messagebox.showerror("Error", "Spread point must be a number, for example 0.00001")
+                return
 
         clear_log()
         convert_btn.configure(state="disabled")
@@ -2458,14 +3263,27 @@ def run_gui() -> None:
         active_col_map = dict(_col_map) if _col_map else None
         tz_spec = v_tz.get().strip() or None
 
-        def worker():
+        def worker(ignore_memory=False):
             try:
                 result = convert(inp, out, sym, tf, fmt, log,
                                  as_ticks=as_ticks, col_map=active_col_map,
-                                 tz=tz_spec)
+                                 tz=tz_spec, ignore_memory_check=ignore_memory,
+                                 point=point)
                 root.after(0, lambda: on_done(result))
+            except NotEnoughMemory as exc:
+                root.after(0, lambda e=exc: on_memory(e))
             except Exception as exc:
                 root.after(0, lambda e=exc: on_error(str(e)))
+
+        def on_memory(exc):
+            # The estimate is said, and the user decides: a computer that can
+            # page to disk may still finish, slowly. The window asks, so its
+            # text names no command-line switch.
+            if messagebox.askyesno("Not enough memory", f"{exc.reason}\n\nConvert anyway?"):
+                log("Converting anyway, without the memory check.", "dim")
+                threading.Thread(target=worker, args=(True,), daemon=True).start()
+            else:
+                on_error(exc.reason)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2566,15 +3384,24 @@ def main() -> None:
                         help="Input format (default: auto-detect)")
     parser.add_argument("--ticks",  action="store_true",
                         help="Write raw ticks (payload_type=1, 32-byte TickRecord). "
-                             "Only for tick-based inputs (dukascopy). Ignores --tf.")
+                             "Only for tick formats (dukascopy, mt5ticks, "
+                             "ninjatraderticks, genericticks). Ignores --tf.")
     parser.add_argument("--tz",
                         help="Source timezone of the input timestamps. "
                              "An IANA zone name such as Europe/Helsinki (DST-aware) "
                              "or a fixed offset such as +02:00. REQUIRED for formats "
                              "that store a bare wall clock (mt4, mt5, mt4hst, "
-                             "ninjatrader, tradestation, generic); refused for formats "
-                             "whose timestamps already fix an instant (dukascopy, "
+                             "mt5ticks, ninjatrader, ninjatraderticks, tradestation, "
+                             "generic, genericticks); refused for formats whose "
+                             "timestamps already fix an instant (dukascopy, "
                              "binance, bybit, tradingview).")
+    parser.add_argument("--point", type=float,
+                        help="The price of one point of an MT4/MT5 spread column "
+                             "(mt4, mt5, mt4hst), e.g. 0.00001 for EURUSD at five "
+                             "digits. Default: the .hst header's digits, or the most "
+                             "decimals the CSV's prices are written with.")
+    parser.add_argument("--ignore-memory-check", action="store_true",
+                        help="Convert even when the file needs more memory than is available")
     parser.add_argument("--gui",    action="store_true", help="Launch GUI")
     parser.add_argument("--info",   metavar="FILE",      help="Print header info of a .bin file")
     parser.add_argument("--formats", action="store_true", help="List all supported input formats")
@@ -2611,7 +3438,8 @@ def main() -> None:
     try:
         result = convert(args.input, args.output, args.symbol, args.tf or 0,
                          fmt=args.format, progress=print, as_ticks=args.ticks,
-                         tz=args.tz)
+                         tz=args.tz, ignore_memory_check=args.ignore_memory_check,
+                         point=args.point)
         # `convert` already printed the full count line through
         # `progress`. This repeats the one count that is a LOSS, on stderr, so
         # it survives a run whose stdout is piped into a log nobody reads and
@@ -2630,5 +3458,260 @@ def main() -> None:
         sys.exit(1)
 
 
+# =============================================================================
+# The zone rules DataConvert carries (see carried_zone): the IANA time zone
+# database's TZif files of these zones, base64. Public domain.
+# =============================================================================
+# -- carried zone rules: generated, do not edit by hand ---------------------
+ZONES_VERSION = "2025b"
+_ZONES = {
+    "Europe/Helsinki": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjAAAABAAAABH/////U7omm/////+k"
+        "c28b/////8vOUWD/////zMDlYAAAAAAVI92AAAAAABYTzoAAAAAAFwO/gAAAAAAX87CAAAAA"
+        "ABjjr5AAAAAAGdOgkAAAAAAaw5GQAAAAABu8vRAAAAAAHKyuEAAAAAAdnJ8QAAAAAB6MkBAA"
+        "AAAAH3yBEAAAAAAgbHIQAAAAACFcYxAAAAAAIkxUEAAAAAAjPEUQAAAAACQsNhAAAAAAJRwn"
+        "EAAAAAAmDBgQAAAAACcFQ5AAAAAAJ/U0kAAAAAAo5SWQAAAAACnVFpAAAAAAKsUHkAAAAAAr"
+        "tPiQAAAAACyk6ZAAAAAALZTakAAAAAAuhMuQAAAAAC90vJAAAAAAMGStkAAAAAAxXdkQAQMC"
+        "AwIDAgMCAwIDAgMCAwIDAgMCAwIDAgMCAwIDAgMCAwIAABdlAAAAABdlAAQAACowAQgAABwg"
+        "AA1MTVQASE1UAEVFU1QARUVUAApFRVQtMkVFU1QsTTMuNS4wLzMsTTEwLjUuMC80Cg=="),
+    "Europe/Athens": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA3AAAABgAAABr/////dD+YRP////+b"
+        "gCGA/////7l86eD/////ucav0P/////J8mPg/////8oQqFD/////zOdLEP/////Nqkzw////"
+        "/86iGOD/////z5NpcP/////fE55g/////9+3ClAAAAAACexeYAAAAAALGPRgAAAAAAvNrgAA"
+        "AAAADL2fAAAAAAANpFWAAAAAAA6MXYAAAAAAD4Q3gAAAAAAQavwQAAAAABFke/AAAAAAElKq"
+        "8AAAAAATRoJgAAAAABQzwlAAAAAAFSPrkAAAAAAWE9yQAAAAABcDzZAAAAAAF/O+kAAAAAAY"
+        "46+QAAAAABnToJAAAAAAGsORkAAAAAAbvL0QAAAAABysrhAAAAAAHZyfEAAAAAAejJAQAAAA"
+        "AB98gRAAAAAAIGxyEAAAAAAhXGMQAAAAACJMVBAAAAAAIzxFEAAAAAAkLDYQAAAAACUcJxAA"
+        "AAAAJgwYEAAAAAAnBUOQAAAAACf1NJAAAAAAKOUlkAAAAAAp1RaQAAAAACrFB5AAAAAAK7T4"
+        "kAAAAAAspOmQAAAAAC2U2pAAAAAALoTLkAAAAAAvdLyQAAAAADBkrZAAAAAAMV3ZEAEDAgMC"
+        "BQQFBAMCAwIDAgMCAwIDAgMCAwIDAgMCAwIDAgMCAwIDAgMCAwIDAgMCAwIDAgMCAwIAABY8"
+        "AAAAABY8AAQAACowAQgAABwgAA0AAA4QABEAABwgARVMTVQAQU1UAEVFU1QARUVUAENFVABD"
+        "RVNUAApFRVQtMkVFU1QsTTMuNS4wLzMsTTEwLjUuMC80Cg=="),
+    "Europe/Kyiv": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAnAAAACAAAACL/////VrbHZP////+q"
+        "Gadk/////7WkGWD/////ys0u0P/////M50sQ/////82pF5D/////zqJDEP/////OzahwAAAA"
+        "ABUnp9AAAAAAFhjcQAAAAAAXCNtQAAAAABf6D8AAAAAAGOoO0AAAAAAZ20NAAAAAABrMk9AA"
+        "AAAAG7yg8AAAAAAcrJHwAAAAAB2cgvAAAAAAHoxz8AAAAAAffGTwAAAAACBsVfAAAAAAIVxG"
+        "8AAAAAAiTDfwAAAAACM8KPAAAAAAJCwZ8AAAAAAlHArwAAAAACYL+/AAAAAAJo0g4AAAAAAo"
+        "5ReAAAAAACnVCIAAAAAAKsT5gAAAAAArtOqAAAAAACyk24AAAAAALZTMgAAAAAAuhL2AAAAA"
+        "AC90roAAAAAAMGSfgAAAAAAxXcsAAAAAADGWUVABAgMFBAUEAwYDBgMGAwYDBgMGAwYDBgMG"
+        "AwYHAgcCBwIHAgcCBwcAABycAAAAABycAAQAABwgAAgAACowAAwAAA4QABAAABwgARQAADhA"
+        "ARkAACowAR1MTVQAS01UAEVFVABNU0sAQ0VUAENFU1QATVNEAEVFU1QACkVFVC0yRUVTVCxN"
+        "My41LjAvMyxNMTAuNS4wLzQK"),
+    "Europe/Berlin": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8AAAABAAAABL/////b6Jh+P////+b"
+        "DBdg/////5vV2vD/////nNmukP////+dpLWQ/////565kJD/////n4SXkP/////ICXGQ////"
+        "/8znSxD/////zakXkP/////OokMQ/////8+SNBD/////0IIlEP/////RchYQ/////9G2lgD/"
+        "////0li+gP/////SoU8Q/////9NjG5D/////1EsjkP/////VOdEg/////9Vn55D/////1ahz"
+        "AP/////WKbQQ/////9csGhD/////2AmWEP/////ZAsGQ/////9npeBAAAAAAE01EEAAAAAAU"
+        "M/qQAAAAABUj65AAAAAAFhPckAAAAAAXA82QAAAAABfzvpAAAAAAGOOvkAAAAAAZ06CQAAAA"
+        "ABrDkZAAAAAAG7y9EAAAAAAcrK4QAAAAAB2cnxAAAAAAHoyQEAAAAAAffIEQAAAAACBschAA"
+        "AAAAIVxjEAAAAAAiTFQQAAAAACM8RRAAAAAAJCw2EAAAAAAlHCcQAAAAACYMGBAAAAAAJwVD"
+        "kAAAAAAn9TSQAAAAACjlJZAAAAAAKdUWkAAAAAAqxQeQAAAAACu0+JAAAAAALKTpkAAAAAAt"
+        "lNqQAAAAAC6Ey5AAAAAAL3S8kAAAAAAwZK2QAAAAADFd2RACAQIBAgECAQIBAgECAQMBAgEC"
+        "AQMBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgEAAAyIAAAAABwgAQQA"
+        "AA4QAAkAACowAQ1MTVQAQ0VTVABDRVQAQ0VNVAAKQ0VULTFDRVNULE0zLjUuMCxNMTAuNS4w"
+        "LzMK"),
+    "Europe/Paris": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABlAAAABwAAAB//////a8mbz/////+R"
+        "YFBP/////5tHePD/////m9cscP////+cvJFw/////53ASPD/////non+cP////+foCrw////"
+        "/6BgpfD/////oYAM8P////+iLhLw/////6N6TPD/////pDWB8P////+lXiNw/////6YlNfD/"
+        "////pyeb8P////+oWCZw/////6kHffD/////qe40cP////+q51/w/////6vXUPD/////rMdB"
+        "8P////+tyafw/////66nI/D/////r6BPcP////+whwXw/////7GJa/D/////snAicP////+z"
+        "cohw/////7RQBHD/////tUkv8P////+2L+Zw/////7cyTHD/////uA/IcP////+4/7lw////"
+        "/7nvqnD/////utZg8P////+72Mbw/////7zIt/D/////vbio8P////++n19w/////7+YivD/"
+        "////wJrw8P/////BeGzw/////8JoXfD/////w1hO8P/////EPwVw/////8U4MPD/////xjqW"
+        "8P/////HWKxw/////8faCaD/////yGwn4P/////M50sQ/////82pF5D/////zqJDEP/////P"
+        "kjQQ/////9BP4eD/////0Inx8P/////RchYQ/////9JOQJAAAAAAC7s5AAAAAAAMqxvwAAAA"
+        "AA2kY5AAAAAADosaEAAAAAAPhEWQAAAAABB0NpAAAAAAEWQnkAAAAAASVBiQAAAAABNNRBAA"
+        "AAAAFDP6kAAAAAAVI+uQAAAAABYT3JAAAAAAFwPNkAAAAAAX876QAAAAABjjr5AAAAAAGdOg"
+        "kAAAAAAaw5GQAAAAABu8vRAAAAAAHKyuEAAAAAAdnJ8QAAAAAB6MkBAAAAAAH3yBEAAAAAAg"
+        "bHIQAAAAACFcYxAAAAAAIkxUEAAAAAAjPEUQAAAAACQsNhAAAAAAJRwnEAAAAAAmDBgQAAAA"
+        "ACcFQ5AAAAAAJ/U0kAAAAAAo5SWQAAAAACnVFpAAAAAAKsUHkAAAAAArtPiQAAAAACyk6ZAA"
+        "AAAALZTakAAAAAAuhMuQAAAAAC90vJAAAAAAMGStkAAAAAAxXdkQAQMCAwIDAgMCAwIDAgMC"
+        "AwIDAgMCAwIDAgMCAwIDAgMCAwIDAgMCAwIDAgMCAwIDAgMCBQQFBAUGAgYEBQQFBAUEBQQF"
+        "BAUEBQQFBAUEBQQFBAUEBQQFBAUEBQQFBAUEBQQFBAUAAAIxAAAAAAIxAAQAAA4QAQgAAAAA"
+        "AA0AAA4QABEAABwgARUAABwgARpMTVQAUE1UAFdFU1QAV0VUAENFVABDRVNUAFdFTVQACkNF"
+        "VC0xQ0VTVCxNMy41LjAsTTEwLjUuMC8zCg=="),
+    "Europe/Zurich": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAlAAAABAAAABH/////JPDqgP////9x"
+        "1AaG/////8oXagD/////yuJxAP/////L90wA/////8zCUwAAAAAAFSPrkAAAAAAWE9yQAAAA"
+        "ABcDzZAAAAAAF/O+kAAAAAAY46+QAAAAABnToJAAAAAAGsORkAAAAAAbvL0QAAAAABysrhAA"
+        "AAAAHZyfEAAAAAAejJAQAAAAAB98gRAAAAAAIGxyEAAAAAAhXGMQAAAAACJMVBAAAAAAIzxF"
+        "EAAAAAAkLDYQAAAAACUcJxAAAAAAJgwYEAAAAAAnBUOQAAAAACf1NJAAAAAAKOUlkAAAAAAp"
+        "1RaQAAAAACrFB5AAAAAAK7T4kAAAAAAspOmQAAAAAC2U2pAAAAAALoTLkAAAAAAvdLyQAAAA"
+        "ADBkrZAAAAAAMV3ZEAEDAgMCAwIDAgMCAwIDAgMCAwIDAgMCAwIDAgMCAwIDAgMCAwIAAAgA"
+        "AAAAAAb6AAQAABwgAQgAAA4QAA1MTVQAQk1UAENFU1QAQ0VUAApDRVQtMUNFU1QsTTMuNS4w"
+        "LE0xMC41LjAvMwo="),
+    "Europe/London": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACfAAAABQAAABH/////Gl0Jy/////+b"
+        "Jq2g/////5vWBSD/////nM8woP////+dpMOg/////56cnaD/////n5caoP////+ghbog////"
+        "/6F2/KD/////omWcIP////+je8ig/////6ROuKD/////pT/7IP////+mJWAg/////6cnxiD/"
+        "////qCosIP////+o6/ig/////6oA06D/////qtUVIP////+r6fAg/////6zHbCD/////rcnS"
+        "IP////+up04g/////6+geaD/////sIcwIP////+xktCg/////7JwTKD/////s3KyoP////+0"
+        "UC6g/////7VJWiD/////tjAQoP////+3Mnag/////7gP8qD/////uRJYoP////+579Sg////"
+        "/7rpACD/////u9jxIP////+821cg/////7240yD/////vrH+oP////+/mLUg/////8CbGyD/"
+        "////wXiXIP/////Cev0g/////8NYeSD/////xFGkoP/////FOFsg/////8Y6wSD/////x1jW"
+        "oP/////H2gmg/////8oWJpD/////ypdZkP/////L0R6Q/////8x3O5D/////zbEAkP/////O"
+        "YFgQ/////8+Q4pD/////0G5ekP/////RchYQ/////9H7MhD/////0mn+IP/////TYymg////"
+        "/9RJ4CD/////1R4hoP/////VQv2Q/////9Xf4BD/////1k6sIP/////W/gOg/////9gujiD/"
+        "////2PmVIP/////aDnAg/////9rr7CD/////2+UXoP/////cy84g/////93E+aD/////3rTq"
+        "oP/////frhYg/////+CUzKD/////4XJIoP/////ia3Qg/////+NSKqD/////5FSQoP/////l"
+        "Mgyg/////+Y9rSD/////5xspIP/////oFFSg/////+j7CyD/////6f1xIP/////q2u0g////"
+        "/+vdUyD/////7LrPIP/////ts/qg/////+6asSD/////74FnoP/////wn30g//////FhSaD/"
+        "////8n9fIP/////zSmYg//////RfQSD/////9SENoP/////2PyMg//////cA76D/////+B8F"
+        "IP/////44NGg//////n+5yD/////+sCzoP/////76AOg//////x7q6D//////ce7cAAAAAAD"
+        "cMYgAAAAAAQpWCAAAAAABVCoIAAAAAAGCTogAAAAAAcwiiAAAAAAB+kcIAAAAAAJEGwgAAAA"
+        "AAnI/iAAAAAACvBOIAAAAAALshqgAAAAAAzQMCAAAAAADZH8oAAAAAAOsBIgAAAAAA9x3qAA"
+        "AAAAEJkuoAAAAAARUcCgAAAAABJ5EKAAAAAAEzGioAAAAAAUWPKgAAAAABUj65AAAAAAFjjG"
+        "kAAAAAAXA82QAAAAABgYqJAAAAAAGOOvkAAAAAAZ+IqQAAAAABrDkZAAAAAAG+GnEAAAAAAc"
+        "rK4QAAAAAB3BiRAAAAAAHoyQEAAAAAAfoWsQAAAAACBschAAAAAAIYFNEAAAAAAiTFQQAAAA"
+        "ACNhLxAAAAAAJCw2EAAAAAAlSkuQAAAAACYMGBAAAAAAJyotkAAAAAAn9TSQAAAAACkKD5AA"
+        "AAAAKdUWkAAAAAAq6fGQAAAAACu0+JAAAAAALMnTkAAAAAAtlNqQAAAAAC6ptZAAAAAAL3S8"
+        "kAAAAAAwiZeQAAAAADDnJAACAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgEC"
+        "AQIBAgECAQIBAgECAQMBAwEDAQMBAwECAQIBAwECAQIBAgECAQIBAgECAQIBAgECAQIBAgEC"
+        "AQIBAgECAQIBAgECAQIBAgEEAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIB"
+        "AgECAQIBAgECAQIBAgL///+1AAAAAA4QAQQAAAAAAAgAABwgAQwAAA4QAARMTVQAQlNUAEdN"
+        "VABCRFNUAApHTVQwQlNULE0zLjUuMC8xLE0xMC41LjAK"),
+    "Europe/Moscow": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABOAAAACwAAACb/////VrbAx/////+b"
+        "Xx7H/////50+8nn/////niru+f////+e9zlp/////5+EV/n/////oNhs6f////+hADmA////"
+        "/6E8pkD/////pBBtwP////+kPTKw/////6UVaLD/////pT0DwP////+nHkVQ/////7WkGWAA"
+        "AAAAFSen0AAAAAAWGNxAAAAAABcI21AAAAAAF/oPwAAAAAAY6g7QAAAAABnbQ0AAAAAAGsyT"
+        "0AAAAAAbvKDwAAAAAByskfAAAAAAHZyC8AAAAAAejHPwAAAAAB98ZPAAAAAAIGxV8AAAAAAh"
+        "XEbwAAAAACJMN/AAAAAAIzwo8AAAAAAkLBnwAAAAACUcCvAAAAAAJgv78AAAAAAnBSdwAAAA"
+        "ACf1GHAAAAAAKOUXgAAAAAApeL+AAAAAACnU+nAAAAAAKsTrcAAAAAArtNxwAAAAACykzXAA"
+        "AAAALZS+cAAAAAAuhK9wAAAAAC90oHAAAAAAMGSRcAAAAAAxXbzwAAAAADJyl/AAAAAAMz2e"
+        "8AAAAAA0UnnwAAAAADUdgPAAAAAANjJb8AAAAAA2/WLwAAAAADgbeHAAAAAAON1E8AAAAAA5"
+        "+1pwAAAAADq9JvAAAAAAO9s8cAAAAAA8pkNwAAAAAD27HnAAAAAAPoYlcAAAAAA/mwBwAAAA"
+        "AEBmB3AAAAAAQYQc8AAAAABCRelwAAAAAENj/vAAAAAARCXLcAAAAABFQ+DwAAAAAEYFrXAA"
+        "AAAARyPC8AAAAABH7snwAAAAAEkDpPAAAAAASc6r8AAAAABK44bwAAAAAEuujfAAAAAATMyj"
+        "cAAAAABNjm/wAAAAAFRMHWABAwIDBAIEBQYFBwUGCAYFBgUGBQYFBgUGBQYFBgUGBQYFBgkI"
+        "BgUGBQYFBgUGBQYFBgUGBQYFBgUGBQYFBgUGBQYFBgUGBQYFBgUGCgYAACM5AAAAACM5AAQA"
+        "ADGHAQgAACN3AAQAAD+XAQwAADhAAREAACowABUAAEZQARkAABwgAB0AACowASEAADhAABVM"
+        "TVQATU1UAE1TVABNRFNUAE1TRABNU0sAKzA1AEVFVABFRVNUAApNU0stMwo="),
+    "America/New_York": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACvAAAABQAAABT/////XgPwkP////+e"
+        "ph5w/////5+662D/////oIYAcP////+hms1g/////6Jl4nD/////o4Pp4P////+kaq5w////"
+        "/6U1p2D/////plPK8P////+nFYlg/////6gzrPD/////qP6l4P////+qE47w/////6reh+D/"
+        "////q/Nw8P////+svmng/////63TUvD/////rp5L4P////+vszTw/////7B+LeD/////sZxR"
+        "cP////+yZ0pg/////7N8M3D/////tEcsYP////+1XBVw/////7YnDmD/////tzv3cP////+4"
+        "BvBg/////7kb2XD/////uebSYP////+7BPXw/////7vGtGD/////vOTX8P////+9r9Dg////"
+        "/77EufD/////v4+y4P/////ApJvw/////8FvlOD/////woR98P/////DT3bg/////8RkX/D/"
+        "////xS9Y4P/////GTXxw/////8cPOuD/////yC1ecP/////I+Fdg/////8oNQHD/////ytg5"
+        "YP/////LiPBw/////9Ij9HD/////0mD74P/////TdeTw/////9RA3eD/////1VXG8P/////W"
+        "IL/g/////9c1qPD/////2ACh4P/////ZFYrw/////9ngg+D/////2v6ncP/////bwGXg////"
+        "/9zeiXD/////3amCYP/////evmtw/////9+JZGD/////4J5NcP/////haUZg/////+J+L3D/"
+        "////40koYP/////kXhFw/////+VXLuD/////5kct8P/////nNxDg/////+gnD/D/////6Rby"
+        "4P/////qBvHw/////+r21OD/////6+bT8P/////s1rbg/////+3GtfD/////7r/TYP/////v"
+        "r9Jw//////CftWD/////8Y+0cP/////yf5dg//////NvlnD/////9F95YP/////1T3hw////"
+        "//Y/W2D/////9y9acP/////4KHfg//////kPPHD/////+ghZ4P/////6+Fjw//////voO+D/"
+        "/////Ng68P/////9yB3g//////64HPD//////6f/4AAAAAAAl/7wAAAAAAGH4eAAAAAAAnfg"
+        "8AAAAAADcP5gAAAAAARg/XAAAAAABVDgYAAAAAAGQN9wAAAAAAcwwmAAAAAAB40ZcAAAAAAJ"
+        "EKRgAAAAAAmtlPAAAAAACvCGYAAAAAAL4IVwAAAAAAzZouAAAAAADcBncAAAAAAOuYTgAAAA"
+        "AA+pg/AAAAAAEJlm4AAAAAARiWXwAAAAABJ5SOAAAAAAE2lH8AAAAAAUWSrgAAAAABVJKfAA"
+        "AAAAFjkM4AAAAAAXKQvwAAAAABgiKWAAAAAAGQjt8AAAAAAaAgtgAAAAABryCnAAAAAAG+Ht"
+        "YAAAAAAc0exwAAAAAB3Bz2AAAAAAHrHOcAAAAAAfobFgAAAAACB2APAAAAAAIYGTYAAAAAAi"
+        "VeLwAAAAACNqr+AAAAAAJDXE8AAAAAAlSpHgAAAAACYVpvAAAAAAJypz4AAAAAAn/sNwAAAA"
+        "ACkKVeAAAAAAKd6lcAAAAAAq6jfgAAAAACu+h3AAAAAALNNUYAAAAAAtnmlwAAAAAC6zNmAA"
+        "AAAAL35LcAAAAAAwkxhgAAAAADFnZ/AAAAAAMnL6YAAAAAAzR0nwAAAAADRS3GAAAAAANScr"
+        "8AAAAAA2Mr5gAAAAADcHDfAAAAAAOBva4AAAAAA45u/wAAAAADn7vOAAAAAAOsbR8AAAAAA7"
+        "257gAAAAADyv7nAAAAAAPbuA4AAAAAA+j9BwAAAAAD+bYuAAAAAAQG+ycAAAAABBhH9gAAAA"
+        "AEJPlHAAAAAAQ2RhYAAAAABEL3ZwAAAAAEVEQ2AAAAAARfOo8AIBAgECAQIBAgECAQIBAgEC"
+        "AQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIDBAIBAgECAQIBAgECAQIBAgECAQIB"
+        "AgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIB"
+        "AgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgH//7qe"
+        "AAD//8fAAQT//7mwAAj//8fAAQz//8fAARBMTVQARURUAEVTVABFV1QARVBUAApFU1Q1RURU"
+        "LE0zLjIuMCxNMTEuMS4wCg=="),
+    "America/Chicago": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACvAAAABgAAABj/////XgP+oP////+e"
+        "piyA/////5+6+XD/////oIYOgP////+hmttw/////6LLdAD/////o4P38P////+kRdKA////"
+        "/6Vj2fD/////plPZAP////+nFZdw/////6gzuwD/////qP6z8P////+qE50A/////6relfD/"
+        "////q/N/AP////+svnfw/////63TYQD/////rp5Z8P////+vs0MA/////7B+O/D/////sZxf"
+        "gP////+yZ1hw/////7N8QYD/////tEc6cP////+1XCOA/////7YnHHD/////tzwFgP////+4"
+        "Bv5w/////7kb54D/////uebgcP////+7BQQA/////7vGwnD/////vOTmAP////+9r97w////"
+        "/77EyAD/////v4/A8P/////AWtYA/////8GwPHD/////woSMAP/////DT4Tw/////8RkbgD/"
+        "////xS9m8P/////GTYqA/////8cPSPD/////yC1sgP/////I+GVw/////8oNToD/////ythH"
+        "cP/////LiP6A/////9Ij9HD/////0mEJ8P/////TdfMA/////9RA6/D/////1VXVAP/////W"
+        "IM3w/////9c1twD/////2ACv8P/////ZFZkA/////9ngkfD/////2v61gP/////bwHPw////"
+        "/9zel4D/////3amQcP/////evnmA/////9+JcnD/////4J5bgP/////haVRw/////+J+PYD/"
+        "////40k2cP/////kXh+A/////+VXPPD/////5kc8AP/////nNx7w/////+gnHgD/////6RcA"
+        "8P/////qBwAA/////+r24vD/////6+biAP/////s1sTw/////+3GxAD/////7r/hcP/////v"
+        "r+CA//////Cfw3D/////8Y/CgP/////yf6Vw//////NvpID/////9F+HcP/////1T4aA////"
+        "//Y/aXD/////9y9ogP/////4KIXw//////kPSoD/////+ghn8P/////6+GcA//////voSfD/"
+        "/////NhJAP/////9yCvw//////64KwD//////6gN8AAAAAAAmA0AAAAAAAGH7/AAAAAAAnfv"
+        "AAAAAAADcQxwAAAAAARhC4AAAAAABVDucAAAAAAGQO2AAAAAAAcw0HAAAAAAB40ngAAAAAAJ"
+        "ELJwAAAAAAmtowAAAAAACvCUcAAAAAAL4JOAAAAAAAzZsPAAAAAADcB1gAAAAAAOuZLwAAAA"
+        "AA+pkgAAAAAAEJl08AAAAAARiXQAAAAAABJ5VvAAAAAAE2lWAAAAAAAUWTjwAAAAABVJOAAA"
+        "AAAAFjka8AAAAAAXKRoAAAAAABgiN3AAAAAAGQj8AAAAAAAaAhlwAAAAABryGIAAAAAAG+H7"
+        "cAAAAAAc0fqAAAAAAB3B3XAAAAAAHrHcgAAAAAAfob9wAAAAACB2DwAAAAAAIYGhcAAAAAAi"
+        "VfEAAAAAACNqvfAAAAAAJDXTAAAAAAAlSp/wAAAAACYVtQAAAAAAJyqB8AAAAAAn/tGAAAAA"
+        "ACkKY/AAAAAAKd6zgAAAAAAq6kXwAAAAACu+lYAAAAAALNNicAAAAAAtnneAAAAAAC6zRHAA"
+        "AAAAL35ZgAAAAAAwkyZwAAAAADFndgAAAAAAMnMIcAAAAAAzR1gAAAAAADRS6nAAAAAANSc6"
+        "AAAAAAA2MsxwAAAAADcHHAAAAAAAOBvo8AAAAAA45v4AAAAAADn7yvAAAAAAOsbgAAAAAAA7"
+        "26zwAAAAADyv/IAAAAAAPbuO8AAAAAA+j96AAAAAAD+bcPAAAAAAQG/AgAAAAABBhI1wAAAA"
+        "AEJPooAAAAAAQ2RvcAAAAABEL4SAAAAAAEVEUXAAAAAARfO3AAIBAgECAQIBAgECAQIBAgEC"
+        "AQIBAgECAQIBAgECAQIBAgECAQIDAgECAQIBAgECAQIEBQIBAgECAQIBAgECAQIBAgECAQIB"
+        "AgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIB"
+        "AgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgH//63U"
+        "AAD//7mwAQT//6ugAAj//7mwAAz//7mwARD//7mwARRMTVQAQ0RUAENTVABFU1QAQ1dUAENQ"
+        "VAAKQ1NUNkNEVCxNMy4yLjAsTTExLjEuMAo="),
+    "Asia/Tokyo": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJAAAAAwAAAAz/////ZcKkcP/////X"
+        "PgJw/////9ftWfD/////2Pj6cP/////ZzTvw/////9sHAPD/////260d8P/////c5uLw////"
+        "/92M//ACAQIBAgECAQIAAIMDAAAAAIygAQQAAH6QAAhMTVQASkRUAEpTVAAKSlNULTkK"),
+    "Asia/Hong_Kong": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABFAAAABQAAABb/////hWljkP/////K"
+        "TTEw/////8rbkzD/////y0txeP/////SoN6Q/////9Nr14D/////1JNYuP/////VQrA4////"
+        "/9ZzOrj/////1z5BuP/////YLjK4/////9j5Obj/////2g4UuP/////a2Ru4/////9vt9rj/"
+        "////3Lj9uP/////dzdi4/////96iGjj/////37b1OP/////ggfw4/////+GWySj/////4k9p"
+        "OP/////jdqso/////+QvSzj/////5V/HqP/////mDy04/////+c/qaj/////5/hJuP/////p"
+        "H4uo/////+nYK7j/////6v9tqP/////ruA24/////+zfT6j/////7ZfvuP/////uyGwo////"
+        "/+930bj/////8KhOKP/////xV7O4//////KIMCj/////80DQOP/////0aBIo//////Ugsjj/"
+        "////9kf0KP/////3JX44//////gVYSj/////+QVgOP/////59UMo//////rlQjj/////+95f"
+        "qP/////8zl64//////2+Qaj//////q5AuP//////niOoAAAAAACOIrgAAAAAAX4FqAAAAAAC"
+        "bgS4AAAAAANd56gAAAAABE3muAAAAAAFRwQoAAAAAAY3AzgAAAAABybmKAAAAAAHgz04AAAA"
+        "AAkGyCgAAAAACfbHOAAAAAAK5qooAAAAAAvWqTgAAAAADMaMKAAAAAARmzk4AAAAABJvbKgB"
+        "AgMEAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIB"
+        "AgECAQIBAgECAQIBAgEAAGsKAAAAAHCAAAQAAH6QAQgAAHeIAQ0AAH6QABJMTVQASEtUAEhL"
+        "U1QASEtXVABKU1QACkhLVC04Cg=="),
+    "Asia/Singapore": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAACAAAACD/////fjZTo/////+G"
+        "g4Wj/////7pnTpD/////wArkYP/////Ks+Vg/////8uRXwj/////0kht8AAAAAAWke4AAQID"
+        "BAUGBQcAAGFdAAAAAGFdAAQAAGJwAAgAAGcgAQwAAGcgAAwAAGl4ABIAAH6QABgAAHCAABxM"
+        "TVQAU01UACswNwArMDcyMAArMDczMAArMDkAKzA4AAo8KzA4Pi04Cg=="),
+    "Australia/Sydney": (
+        "VFppZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAAAAAAVFpp"
+        "ZjIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABTAAAAAwAAAA7/////cxZ/PP////+c"
+        "TsKA/////5y8LwD/////y1SzAP/////Lx2WA/////8y3VoD/////zadHgP/////OoHMA////"
+        "/8+HKYAAAAAAA3A5gAAAAAAEDRwAAAAAAAVQG4AAAAAABfY4gAAAAAAHL/2AAAAAAAfWGoAA"
+        "AAAACQ/fgAAAAAAJtfyAAAAAAArvwYAAAAAAC58ZAAAAAAAM2N4AAAAAAA1++wAAAAAADrjA"
+        "AAAAAAAPXt0AAAAAABCYogAAAAAAET6/AAAAAAASeIQAAAAAABMeoQAAAAAAFFhmAAAAAAAU"
+        "/oMAAAAAABY4SAAAAAAAFwyJgAAAAAAYIWSAAAAAABjHgYAAAAAAGgFGgAAAAAAap2OAAAAA"
+        "ABvhKIAAAAAAHIdFgAAAAAAdwQqAAAAAAB55nIAAAAAAH5eyAAAAAAAgWX6AAAAAACGAzoAA"
+        "AAAAIkKbAAAAAAAjaesAAAAAACQifQAAAAAAJUnNAAAAAAAl7+oAAAAAACcprwAAAAAAJ8/M"
+        "AAAAAAApCZEAAAAAACmvrgAAAAAAKulzAAAAAAArmMqAAAAAACzSj4AAAAAALXisgAAAAAAu"
+        "snGAAAAAAC9YjoAAAAAAMJJTgAAAAAAxXVqAAAAAADJyNYAAAAAAMz08gAAAAAA0UheAAAAA"
+        "ADUdHoAAAAAANjH5gAAAAAA2/QCAAAAAADgbFgAAAAAAONzigAAAAAA5p+mAAAAAADq8xIAA"
+        "AAAAO9raAAAAAAA8peEAAAAAAD26vAAAAAAAPoXDAAAAAAA/mp4AAAAAAEBlpQAAAAAAQYO6"
+        "gAAAAABCRYcAAAAAAENjnIAAAAAARC6jgAAAAABFQ36AAAAAAEYFSwAAAAAARyNggAAAAABH"
+        "96IAAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgEC"
+        "AQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIBAgECAQIAAI3EAAAAAJqwAQQAAIygAAlMTVQA"
+        "QUVEVABBRVNUAApBRVNULTEwQUVEVCxNMTAuMS4wLE00LjEuMC8zCg=="),
+}
+# -- end of the carried zone rules -------------------------------------------
 if __name__ == "__main__":
     main()
