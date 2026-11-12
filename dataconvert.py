@@ -4,6 +4,8 @@ DataConvert - Universal market data -> BAR6 binary converter.
 
 Supported input formats:
   dukascopy    Dukascopy tick CSV  (LocalTime, Ask, Bid, AskVolume, BidVolume)
+  dukascopyweb Dukascopy web export  (Etc/UTC, Open, High, Low, Close, Volume):
+               bars, or ticks of one side; the file name says which side
   mt5ticks     MT5 tick export  (<DATE> <TIME> <BID> <ASK> <LAST> <VOLUME> <FLAGS>)
   ninjatraderticks  NinjaTrader tick export  (yyyyMMdd HHmmss fffffff;last;bid;ask;volume)
   genericticks Any tick CSV with a header naming a time, a bid and an ask column
@@ -17,11 +19,12 @@ Supported input formats:
   bybit        Bybit / Kraken / generic crypto exchange OHLCV CSV (Unix seconds)
   generic      Auto-detect any OHLCV CSV (column names or positional)
 
-Spreads: the four tick formats carry a bid and an ask per tick, so their ticks
-(--ticks) and the bars made from them (--tf) keep the quoted spread. An MT4/MT5
-bar CSV with a <SPREAD> column and an MT4 .hst file of version 401 carry one
-spread per bar, which is kept too. The other formats carry no quotes: their
-bars are written with bid = ask = close.
+Spreads: the four two-sided tick formats carry a bid and an ask per tick, so
+their ticks (--ticks) and the bars made from them (--tf) keep the quoted
+spread. An MT4/MT5 bar CSV with a <SPREAD> column and an MT4 .hst file of
+version 401 carry one spread per bar, which is kept too. The other formats carry
+no quotes: their bars are written with bid = ask = close. A Dukascopy web export
+holds one side of the quote: its bars and ticks are written with bid = ask.
 
 CLI usage:
   python dataconvert.py INPUT OUTPUT --symbol SYM --tf MINUTES [--format FMT] [--tz ZONE]
@@ -41,26 +44,37 @@ GUI (no arguments, or --gui):
   python dataconvert.py
   python dataconvert.py --gui
 
-Memory: every row of the input is held in memory while it converts, about
-313 MB per million rows. Before converting, the tool estimates what the file
-needs and stops with a message when that is more than the computer has
-available (--ignore-memory-check converts anyway).
+Memory: a tick file (dukascopy, a dukascopyweb tick export, mt5ticks,
+ninjatraderticks, genericticks) converts in at most about 200 MB of memory,
+whatever its size; it needs free disk space beside the output, about 32 bytes
+per tick (twice that while ticks that are not in time order are sorted). A
+bar file is held in memory while it converts, 490 to 1,180 MB per million rows
+depending on its format. Before converting, the tool says
+what the file needs and stops with a message when that is more than the
+computer has available (--ignore-memory-check converts anyway).
+
+One input file per conversion: a history kept in many files (one per hour or
+day) is joined into one file first, the files in time order and the header
+line once.
 """
 
 import argparse
 import base64
 import csv
+import heapq
 import io
 import math
 import os
 import re
+import secrets
 import struct
 import sys
 import threading
 import zipfile
+from operator import itemgetter
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, NamedTuple, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # =============================================================================
@@ -69,17 +83,24 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 MAGIC_V1 = 0x42415235  # "BAR5"
 MAGIC_V2 = 0x42415236  # "BAR6"
 FORMAT_VERSION = 2
+# payload_type: bit 0 = 0 bars, 1 ticks; bit 1 = the volume field holds the
+# source's volume. A file without bit 1 holds 0.0 in every volume field.
 PAYLOAD_BARS  = 0
 PAYLOAD_TICKS = 1
+PAYLOAD_VOLUME_BIT = 2
 
 # FileHeaderV2: magic(4u) version(4u) payload_type(1u) timeframe_min(4u)
 #               record_count(4u) start_ts(8i) end_ts(8i) symbol[16] = 49 bytes
 HDR_V2_FMT = "<IIBIIqq16s"
 HDR_V2_SIZE = struct.calcsize(HDR_V2_FMT)  # 49
 
-# BinaryBarM5: timestamp(8i) open(8f) high(8f) low(8f) close(8f) bid(8f) ask(8f) = 56 bytes
-BAR_FMT  = "<qdddddd"
-BAR_SIZE = struct.calcsize(BAR_FMT)  # 56
+# BinaryBarM5: timestamp(8i) open high low close bid ask volume(8f each) = 64 bytes
+BAR_FMT  = "<qddddddd"
+BAR_SIZE = struct.calcsize(BAR_FMT)  # 64
+
+# A bar record of the earlier layout (before the volume field): 56 bytes.
+# Files of it are not read; --info names them.
+EARLIER_BAR_SIZE = 56
 
 # TickRecord: timestamp(8i) bid(8f) ask(8f) volume(8f) = 32 bytes  (payload_type=1)
 # Matches BinaryFormat::TickRecord in bar_binary.h
@@ -87,10 +108,12 @@ TICK_FMT  = "<qddd"
 TICK_SIZE = struct.calcsize(TICK_FMT)  # 32
 
 assert HDR_V2_SIZE == 49, f"Header size mismatch: {HDR_V2_SIZE}"
-assert BAR_SIZE    == 56, f"Bar size mismatch: {BAR_SIZE}"
+assert BAR_SIZE    == 64, f"Bar size mismatch: {BAR_SIZE}"
 assert TICK_SIZE   == 32, f"Tick size mismatch: {TICK_SIZE}"
 
-Bar = Dict[str, Any]  # {ts: int, open: float, high: float, low: float, close: float, bid: float, ask: float}
+# {ts: int, open: float, high: float, low: float, close: float, bid: float, ask: float}
+# and "volume": float when the source has a traded-volume column (see "Volume").
+Bar = Dict[str, Any]
 ProgressFn = Optional[Callable[[str], None]]
 
 TIMEFRAMES = [1, 2, 3, 4, 5, 10, 15, 30, 60, 120, 240, 1440]
@@ -104,6 +127,9 @@ PLAUSIBLE_TS_MAX_MS = 4_102_444_800_000
 # No instrument trades at a billion: a price above this is a corrupt field.
 # Partiqon's upload and engine hold a file to the same ceiling.
 MAX_PRICE = 1_000_000_000.0
+# The largest volume a record may hold (shares, contracts, crypto base units,
+# FX units all fit); Partiqon's upload and backtest apply the same ceiling.
+MAX_VOLUME = 1e15
 
 # =============================================================================
 # Timestamp parsers
@@ -156,6 +182,8 @@ _RE_FIXED_OFFSET = re.compile(r"^(?:UTC|GMT)?([+-])(\d{1,2})(?::?(\d{2}))?$", re
 #: safety net and not the normal path.
 TZ_POLICY: Dict[str, str] = {
     "dukascopy":    "in_data",
+    # Dukascopy's web export writes every stamp with its UTC offset.
+    "dukascopyweb": "in_data",
     # MT5 stamps ticks with the broker's server clock, NinjaTrader with the
     # display zone set in the platform; a generic tick CSV says nothing.
     "mt5ticks":         "wall",
@@ -822,9 +850,18 @@ def _refuse_unordered(records: List[Dict], path: str, what: str,
         prev = ts
     if not offenders:
         return
-
     descents = sum(1 for o in offenders if o[0] == "descent")
-    repeats = len(offenders) - descents
+    raise _unordered_refusal(path, total, what, allow_repeats, offenders,
+                             descents, len(offenders) - descents, limit)
+
+
+def _unordered_refusal(path: str, total: int, what: str, allow_repeats: bool,
+                       offenders: List[tuple], descents: int, repeats: int,
+                       limit: int = 5) -> "RecordsNotInOrder":
+    """The RecordsNotInOrder for `total` records of which `descents` go back
+    in time and `repeats` repeat the time before them; `offenders` holds at
+    least the first `limit` of them, in order. Shared by the check above and
+    by the streamed tick payload, which keeps only the first ones."""
     lines = []
     for kind, i, ts_i, j, ts_j in offenders[:limit]:
         if kind == "descent":
@@ -834,8 +871,8 @@ def _refuse_unordered(records: List[Dict], path: str, what: str,
         else:
             lines.append("  record %d and record %d are both stamped %s"
                          % (i + 1, j + 1, ts_to_str_exact(ts_i)))
-    if len(offenders) > limit:
-        lines.append("  ... and %d more" % (len(offenders) - limit))
+    if descents + repeats > limit:
+        lines.append("  ... and %d more" % (descents + repeats - limit))
 
     found = []
     if descents:
@@ -875,7 +912,7 @@ def _refuse_unordered(records: List[Dict], path: str, what: str,
                  "source file." if allow_repeats else
                  "Positions are in the sorted payload, not lines in the source "
                  "file -- the parser sorts before writing.")
-    raise RecordsNotInOrder(
+    return RecordsNotInOrder(
         "Refusing to write %s: %d %s records are not %s.\n"
         "%s.\n%s\n%s\n%s" % (path, total, what, order,
                              " and ".join(found), "\n".join(lines),
@@ -908,12 +945,13 @@ REFUSAL_NAMES = 5
 
 def record_problem(rec: Dict, tick: bool = False) -> Optional[str]:
     """Why `rec` (a bar dict, or a tick dict when `tick`) cannot be market data,
-    or None when it can."""
+    or None when it can. A record carrying a "volume" is held to the volume
+    rules too: a number, not negative, at most MAX_VOLUME."""
     ts = rec["ts"]
     if not (PLAUSIBLE_TS_MIN_MS <= ts <= PLAUSIBLE_TS_MAX_MS):
         return "its time is not a plausible date"
     names = _TICK_PRICES if tick else _BAR_PRICES
-    for n in names:
+    for n in names + (("volume",) if "volume" in rec else ()):
         if not math.isfinite(rec[n]):
             return "it holds a value that is not a number"
     for n in names:
@@ -930,6 +968,11 @@ def record_problem(rec: Dict, tick: bool = False) -> Optional[str]:
             return "it opens outside its own high and low"
         if rec["close"] < lo or rec["close"] > hi:
             return "it closes outside its own high and low"
+    if "volume" in rec:
+        if rec["volume"] < 0.0:
+            return "its volume is negative"
+        if rec["volume"] > MAX_VOLUME:
+            return "it holds a volume above 1,000,000,000,000,000"
     return None
 
 
@@ -942,7 +985,8 @@ def _when_safe(ts) -> str:
 
 
 def _values_of(rec: Dict, tick: bool) -> str:
-    names = _TICK_PRICES if tick else ("open", "high", "low", "close")
+    names = (_TICK_PRICES if tick else ("open", "high", "low", "close")) + (
+        ("volume",) if "volume" in rec else ())
     return ", ".join("%s %r" % (n, rec[n]) for n in names)
 
 
@@ -969,6 +1013,15 @@ class _Counts(dict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.audit = _RowAudit()
+        # What the parsers note about the SOURCE (not counts, so not keys):
+        # whether its rows were ticks (counts_summary words duplicates by it),
+        # and the quote side of a one-sided file.
+        self.tick_source = False
+        self.quote_side: Optional[str] = None
+        # Whether this conversion writes the source's volume at all (see
+        # "Volume"): when not, the parsers' records are checked and carried
+        # without it, so a volume column never refuses a file written without.
+        self.read_volume = True
 
 
 def _audit(stats, rec: Dict, row: int, tick: bool = False, unit: str = "row") -> None:
@@ -978,6 +1031,8 @@ def _audit(stats, rec: Dict, row: int, tick: bool = False, unit: str = "row") ->
     audit = getattr(stats, "audit", None)
     if audit is None:
         return
+    if not getattr(stats, "read_volume", True):
+        rec.pop("volume", None)
     reason = record_problem(rec, tick)
     if reason is not None:
         audit.note("%s %d" % (unit, row), rec, reason, tick)
@@ -1023,22 +1078,40 @@ def _refuse_invalid(records: List[Dict], path: str, what: str) -> None:
             continue
         bad += 1
         if len(entries) < REFUSAL_NAMES:
-            entries.append({"where": "%s %d" % (what, i + 1), "ts": rec["ts"],
-                            "reason": reason, "values": _values_of(rec, tick)})
+            entries.append(_invalid_entry(rec, i + 1, what, reason))
     if not bad:
         return
-    raise RecordsInvalid(
+    raise _invalid_refusal(path, len(records), what, entries, bad)
+
+
+def _invalid_entry(rec: Dict, position: int, what: str, reason: str) -> Dict:
+    """How a refusal names record `position` (1-based) of a payload of `what`s."""
+    return {"where": "%s %d" % (what, position), "ts": rec["ts"], "reason": reason,
+            "values": _values_of(rec, what == "tick")}
+
+
+def _invalid_refusal(path: str, total: int, what: str, entries: List[Dict],
+                     bad: int) -> "RecordsInvalid":
+    """The RecordsInvalid for `bad` of `total` records that cannot be market
+    data, the first of them in `entries`. Shared by the check above and by
+    the streamed payloads."""
+    return RecordsInvalid(
         "Refusing to write %s: %d of %d %ss cannot be market data, and Partiqon's "
         "upload would refuse a file holding them.\n%s\n"
         "Positions are in the payload that would have been written (sorted by "
         "time; bars made from ticks hold many source rows), not lines of the "
         "source file.\nCorrect the source data and convert it again. Nothing was "
-        "written." % (path, bad, len(records), what, _refusal_lines(entries, bad)),
+        "written." % (path, bad, total, what, _refusal_lines(entries, bad)),
         offenders=entries, bad=bad)
 
 
-def write_v2(path: str, bars: List[Bar], symbol: str, tf_min: int) -> int:
+def write_v2(path: str, bars: List[Bar], symbol: str, tf_min: int,
+             with_volume: bool = False) -> int:
     """Write bars list to a BAR6 .bin file. Returns total bytes written.
+
+    with_volume: the file declares its volume (bit 1 of payload_type) and every
+    bar's "volume" is written; without it every volume field is 0.0 (see
+    "Volume" for which sources are written with it).
 
     Refuses a payload that does not ascend strictly. A bar source is
     sorted by every parser here, but nothing de-duplicates it, so two CSV rows
@@ -1052,7 +1125,8 @@ def write_v2(path: str, bars: List[Bar], symbol: str, tf_min: int) -> int:
     first_ts, last_ts = _payload_span(bars)
     sym_b = symbol.encode("ascii", errors="replace")[:16].ljust(16, b"\x00")
     hdr = struct.pack(HDR_V2_FMT,
-                      MAGIC_V2, FORMAT_VERSION, PAYLOAD_BARS,
+                      MAGIC_V2, FORMAT_VERSION,
+                      PAYLOAD_BARS | (PAYLOAD_VOLUME_BIT if with_volume else 0),
                       tf_min, len(bars),
                       first_ts, last_ts,
                       sym_b)
@@ -1060,17 +1134,21 @@ def write_v2(path: str, bars: List[Bar], symbol: str, tf_min: int) -> int:
     with open(path, "wb") as f:
         f.write(hdr)
         for b in bars:
+            # A file that declares no volume holds 0.0 in the volume field.
             f.write(struct.pack(BAR_FMT,
                                 b["ts"], b["open"], b["high"],
-                                b["low"], b["close"], b["bid"], b["ask"]))
+                                b["low"], b["close"], b["bid"], b["ask"],
+                                b["volume"] if with_volume else 0.0))
     return HDR_V2_SIZE + len(bars) * BAR_SIZE
 
 
-def write_ticks_v2(path: str, ticks: List[Dict], symbol: str) -> int:
+def write_ticks_v2(path: str, ticks: List[Dict], symbol: str,
+                   with_volume: bool = False) -> int:
     """Write raw ticks to a BAR6 file with payload_type=1 (32-byte TickRecords).
 
-    Header: timeframe_min=0 (tick), payload_type=1.
-    Record: ts(int64) bid(double) ask(double) flags(int64=0).
+    Header: timeframe_min=0 (tick), payload_type=1 (3 with_volume).
+    Record: ts(int64) bid(double) ask(double) volume(double): the tick's
+    "volume" with_volume, else 0.0.
 
     Refuses a payload whose timestamps descend. `parse_dukascopy_ticks`
     returns arrival order and has never sorted, so a shuffled or concatenated
@@ -1085,7 +1163,8 @@ def write_ticks_v2(path: str, ticks: List[Dict], symbol: str) -> int:
     first_ts, last_ts = _payload_span(ticks)
     sym_b = symbol.encode("ascii", errors="replace")[:16].ljust(16, b"\x00")
     hdr = struct.pack(HDR_V2_FMT,
-                      MAGIC_V2, FORMAT_VERSION, PAYLOAD_TICKS,
+                      MAGIC_V2, FORMAT_VERSION,
+                      PAYLOAD_TICKS | (PAYLOAD_VOLUME_BIT if with_volume else 0),
                       0,           # timeframe_min = 0 for ticks
                       len(ticks),
                       first_ts, last_ts,
@@ -1094,8 +1173,83 @@ def write_ticks_v2(path: str, ticks: List[Dict], symbol: str) -> int:
     with open(path, "wb") as f:
         f.write(hdr)
         for tk in ticks:
-            f.write(struct.pack(TICK_FMT, tk["ts"], tk["bid"], tk["ask"], 0.0))
+            f.write(struct.pack(TICK_FMT, tk["ts"], tk["bid"], tk["ask"],
+                                tk["volume"] if with_volume else 0.0))
     return HDR_V2_SIZE + len(ticks) * TICK_SIZE
+
+
+# =============================================================================
+# Volume
+# =============================================================================
+#
+# A parser puts "volume" on its records when its source has a column of traded
+# volume (each parser names its column). A file is written with it -- bit 1 of
+# payload_type set, the values in the records' volume field -- when every
+# record has one and one of them is above 0. Otherwise the file declares no
+# volume and every volume field is 0.0, and the conversion says why:
+#
+#   quoted   Dukascopy's Ask Volume / Bid Volume / Volume are quoted sizes,
+#            never traded volume; never written
+#   off      written without volume, as asked (--no-volume)
+#   none     the source has no volume column
+#   zero     the column holds only 0 (an FX broker's <VOL>, quote ticks)
+#   source   written from the source's volume column
+#
+# A volume that is not a number, negative or above MAX_VOLUME refuses the file
+# and names the source row (record_problem); an empty cell is not a number.
+# Never read as volume: MT4/MT5 <TICKVOL> and a .hst v400 record's volume (the
+# number of price changes), a column not headed exactly "volume" or "vol"
+# (trade_count, vol_lots, Ask Volume), TradeStation's Up and Down.
+
+#: Formats whose size columns are quoted sizes: never written as volume.
+QUOTED_SIZE_FORMATS = ("dukascopy", "dukascopyweb")
+
+#: What a conversion says about the volume it wrote.
+VOLUME_SAYS = {
+    "source": "Volume: written from the source's volume column.",
+    "zero":   "Volume: not written. The volume column holds only 0.",
+    "quoted": "Volume: not written. The size columns of a Dukascopy export are quoted "
+              "sizes, not traded volume.",
+    "none":   "Volume: the source has no volume column; the file is written without volume.",
+    "off":    "Volume: not written, as asked.",
+}
+
+
+def volume_of(records: List[Dict], fmt: str, no_volume: bool = False) -> str:
+    """Which volume `records` are written with (a key of VOLUME_SAYS). A
+    payload written without volume loses the records' "volume". A record
+    without one among records that have it gets a volume that is not a
+    number, so the writer refuses the payload and names it."""
+    carrying, nonzero = 0, False
+    if not (fmt in QUOTED_SIZE_FORMATS or no_volume):
+        carrying = sum(1 for r in records if "volume" in r)
+        nonzero = carrying == len(records) and any(r["volume"] != 0.0 for r in records)
+    state = _volume_state(fmt, no_volume, carrying, len(records), nonzero)
+    if state == "mixed":
+        for r in records:
+            r.setdefault("volume", math.nan)
+        return "source"
+    if state != "source":
+        for r in records:
+            r.pop("volume", None)
+    return state
+
+
+def _volume_state(fmt: str, no_volume: bool, carrying: int, total: int,
+                  nonzero: bool) -> str:
+    """volume_of's rule for `total` records of which `carrying` have a
+    volume, `nonzero` when one of them is not 0: a key of VOLUME_SAYS, or
+    "mixed" when only some records carry one (they are written as "source",
+    and the records without a volume refuse the payload)."""
+    if fmt in QUOTED_SIZE_FORMATS:
+        return "quoted"
+    if no_volume:
+        return "off"
+    if carrying == 0:
+        return "none"
+    if carrying < total:
+        return "mixed"
+    return "source" if nonzero else "zero"
 
 
 # =============================================================================
@@ -1214,7 +1368,8 @@ def _measure_and_sort(records: List[Dict], stats: Optional[Dict[str, int]],
     return sorted(records, key=lambda x: x["ts"])
 
 
-def counts_summary(stats: Optional[Dict[str, int]], tick_payload: bool = False) -> str:
+def counts_summary(stats: Optional[Dict[str, int]], tick_payload: bool = False,
+                   tick_source: Optional[bool] = None) -> str:
     """One line naming every count, including the zeros, and what happens to it.
 
     The zeros are the point. "0 rows skipped" is a measurement a user can rely
@@ -1230,7 +1385,10 @@ def counts_summary(stats: Optional[Dict[str, int]], tick_payload: bool = False) 
                      refuses the conversion -- a successful one therefore has
                      none, and the parenthetical states the policy, not a
                      repair that happened.
-      duplicates     bar path: refused, for the same reason.
+      duplicates     bar path from bar rows: refused, for the same reason.
+                     bar path from TICKS (`tick_source`): ticks
+                     sharing a time are aggregated into their bar like every
+                     other tick; nothing is refused, and the line says so.
                      raw tick path: kept, because many ticks genuinely share a
                      millisecond and collapsing them would delete real data.
       repeated DST   resolved, on both paths -- the second copy of an
@@ -1241,12 +1399,22 @@ def counts_summary(stats: Optional[Dict[str, int]], tick_payload: bool = False) 
     `.get()` on the last count, not `[...]`: a stats dict built by an older
     version -- a caller holding one across an upgrade, or a refusal's attached copy --
     has four keys, and this line must describe it rather than raise on it.
+
+    `tick_source` defaults to what the parsers noted on `stats` (the
+    `tick_source` attribute _mark_tick_source sets); a plain dict says nothing,
+    and its rows are read as bar rows.
     """
     if not stats:
         return ""
+    if tick_source is None:
+        tick_source = bool(getattr(stats, "tick_source", False))
     order_fate = "refused" if tick_payload else "sorted"
-    dupe_fate = ("kept -- ticks may share a millisecond" if tick_payload
-                 else "refused")
+    if tick_payload:
+        dupe_fate = "kept -- ticks may share a millisecond"
+    elif tick_source:
+        dupe_fate = "ticks aggregated into their bar"
+    else:
+        dupe_fate = "refused"
     return (f"{stats['rows_parsed']:,} rows parsed  |  "
             f"{stats['skipped_rows']:,} unreadable rows skipped  |  "
             f"{stats['out_of_order_rows']:,} rows out of order ({order_fate})  |  "
@@ -1282,6 +1450,7 @@ def aggregate_ticks(ticks: List[Dict], tf_min: int) -> List[Bar]:
       high, low   the highest and lowest mid price of the bar's ticks
       close       mid price of the bar's latest tick
       bid, ask    the quote of the bar's latest tick
+      volume      the sum of its ticks' volumes, when the ticks carry one
 
     "Earliest" and "latest" are in TIME order, not in the order the rows sit in
     the source: the ticks are sorted by time first. A position in a file is not
@@ -1293,23 +1462,42 @@ def aggregate_ticks(ticks: List[Dict], tf_min: int) -> List[Bar]:
     the order fills, at the bar's bid or ask; a high taken from the ask would
     reach a long's target half a spread before the mid did.
     """
+    return list(_bars_in_order(_in_time_order(ticks), tf_min))
+
+
+def _bars_in_order(ticks: Iterable[Dict], tf_min: int) -> Iterator[Bar]:
+    """The bars of `ticks`, which are in time order already (ties in file
+    order), one at a time and ascending: the rule of aggregate_ticks.
+
+    In time order a bar's ticks follow one another, so one bar is open at a
+    time and is complete when a tick of a later bar arrives. Each bar takes
+    its ticks in the order they come, so its open, close, quote and the sum
+    of its volumes are those of the time order, wherever the ticks came from;
+    a conversion that streams its ticks gives the same bars as one that holds
+    them all."""
     interval_ms = tf_min * 60 * 1000
-    bar_map: Dict[int, Bar] = {}
-    for tick in _in_time_order(ticks):
+    b: Optional[Bar] = None
+    for tick in ticks:
         ts, bid, ask = tick["ts"], tick["bid"], tick["ask"]
         mid = (bid + ask) / 2.0
         bar_ts = (ts // interval_ms) * interval_ms
-        b = bar_map.get(bar_ts)
-        if b is None:
-            bar_map[bar_ts] = {"ts": bar_ts, "open": mid, "high": mid,
-                               "low": mid, "close": mid, "bid": bid, "ask": ask}
+        if b is None or bar_ts != b["ts"]:
+            if b is not None:
+                yield b
+            b = {"ts": bar_ts, "open": mid, "high": mid,
+                 "low": mid, "close": mid, "bid": bid, "ask": ask}
+            if "volume" in tick:
+                b["volume"] = tick["volume"]
         else:
             if mid > b["high"]:  b["high"] = mid
             if mid < b["low"]:   b["low"]  = mid
             b["close"] = mid
             b["bid"]   = bid
             b["ask"]   = ask
-    return sorted(bar_map.values(), key=lambda x: x["ts"])
+            if "volume" in tick:
+                b["volume"] = b.get("volume", 0.0) + tick["volume"]
+    if b is not None:
+        yield b
 
 
 # =============================================================================
@@ -1320,8 +1508,22 @@ def _auto_delim(sample: str) -> str:
 
 
 #: First cells that mark a Dukascopy tick CSV's first row as its header.
+#: "etc/utc" heads Dukascopy's web export, which has a parser of its own
+#: (parse_dukascopy_web); it is named here too, so that a web export handed to
+#: this parser by --format dukascopy has its header never counted as an
+#: unreadable row.
 _DUKASCOPY_TIME_HEADERS = ("localtime", "local time", "local", "gmt time", "gmt", "utc",
-                           "date", "time", "timestamp")
+                           "etc/utc", "date", "time", "timestamp")
+
+
+def _mark_tick_source(stats) -> None:
+    """Note on a conversion's counts that its rows were ticks, so that the bar
+    path's summary says what became of ticks sharing a time (counts_summary)."""
+    if stats is not None:
+        try:
+            stats.tick_source = True
+        except AttributeError:      # a plain dict from a caller: nothing to note
+            pass
 
 
 def parse_dukascopy(path: str, tf_min: int, progress: ProgressFn = None,
@@ -1333,6 +1535,7 @@ def parse_dukascopy(path: str, tf_min: int, progress: ProgressFn = None,
       01.01.2020 00:01:00.288,11348.0,11347.7,1.0,1.0
     Ticks are aggregated into OHLCV bars.
     """
+    _mark_tick_source(stats)
     ticks = parse_dukascopy_ticks(path, progress, stats=stats)
     if progress:
         progress(f"  Aggregating {len(ticks):,} ticks -> M{tf_min} bars")
@@ -1363,7 +1566,36 @@ def parse_dukascopy_ticks(path: str, progress: ProgressFn = None,
     of a tick download stamped in UTC), and the generic "Date", "Time",
     "Timestamp".
     """
-    ticks: List[Dict] = []
+    return _collect_ticks(_dukascopy_ticks, path, progress, tz, stats)
+
+
+class _ParseEnd:
+    """What a tick parser knows once its file has ended: the rows it could not
+    read, and the file's clock (None for a source that needs none)."""
+
+    __slots__ = ("skipped", "clock")
+
+    def __init__(self) -> None:
+        self.skipped = 0
+        self.clock: Optional[SourceClock] = None
+
+
+def _collect_ticks(ticks_of: Callable[..., Iterator[Dict]], path: str,
+                   progress: ProgressFn, tz: Optional[tzinfo],
+                   stats: Optional[Dict[str, int]]) -> List[Dict]:
+    """A tick parser's ticks as one list in arrival order, measured
+    (_record): what the list-returning parsers below return. A conversion
+    streams the same ticks instead (see "Streaming")."""
+    end = _ParseEnd()
+    ticks = list(ticks_of(path, progress, tz, stats, end))
+    _record(stats, ticks, end.skipped, end.clock)
+    return ticks
+
+
+def _dukascopy_ticks(path: str, progress: ProgressFn, tz: Optional[tzinfo],
+                     stats: Optional[Dict[str, int]], end: _ParseEnd) -> Iterator[Dict]:
+    """parse_dukascopy_ticks's ticks, one at a time; the skipped rows go to `end`."""
+    count = 0
     skipped = 0
     with open(path, newline="", encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
@@ -1382,16 +1614,298 @@ def parse_dukascopy_ticks(path: str, progress: ProgressFn = None,
             try:
                 ask = float(row[1])
                 bid = float(row[2])
-                ticks.append({"ts": ts, "bid": bid, "ask": ask})
-                _audit(stats, ticks[-1], reader.line_num, tick=True)
+                tick = {"ts": ts, "bid": bid, "ask": ask}
+                _audit(stats, tick, reader.line_num, tick=True)
             except ValueError:
                 skipped += 1
+            else:
+                count += 1
+                yield tick
             if progress and i % 250_000 == 0 and i:
                 progress(f"  Parsed {i:,} ticks")
-    _record(stats, ticks, skipped)
+    end.skipped = skipped
     if progress:
-        progress(f"  Loaded {len(ticks):,} ticks ({skipped:,} skipped)")
-    return ticks
+        progress(f"  Loaded {count:,} ticks ({skipped:,} skipped)")
+
+
+# ── The columns of a bar export, by its header ───────────────────────────────
+
+def _bar_columns(hdrs: List[str]) -> Dict[str, int]:
+    """The columns of a bar export by its header (`hdrs` lower-case, stripped):
+    the one header lookup of the bar parsers that read one. An exact header
+    name beats one that merely contains it: "open" is the price column, not
+    "open_time". -1 where the header names no such column.
+
+    "volume" is matched by its exact name only ("volume", "vol"): "Ask Volume"
+    and "best_bid_qty" are quoted sizes, not a bar's volume. The volume column
+    is read into the bar (key "volume"); which sources' volume is written to
+    the file is decided where the file is written."""
+    def find(*names) -> int:
+        for n in names:
+            for ci, h in enumerate(hdrs):
+                if n == h:
+                    return ci
+            for ci, h in enumerate(hdrs):
+                if n in h:
+                    return ci
+        return -1
+
+    def exact(*names) -> int:
+        for n in names:
+            for ci, h in enumerate(hdrs):
+                if n == h:
+                    return ci
+        return -1
+
+    date_col = find("date", "datetime", "timestamp", "time")
+    time_col = find("time")
+    return {"date": date_col, "time": -1 if time_col == date_col else time_col,
+            "open": find("open"), "high": find("high"), "low": find("low"),
+            "close": find("close"), "volume": exact("volume", "vol")}
+
+
+# ── Dukascopy's web export ───────────────────────────────────────────────────
+#
+# What a user downloads from Dukascopy's website is not the tick CSV above:
+#
+#   CNDX.GB-USD_1Minute_ASK_2026-10-28_23_59-23_59_Etc_UTC.csv
+#     Etc/UTC,Open,High,Low,Close,Volume
+#     2026-10-28T08:00:00+00:00,1713.633,1714.298,1713.403,1713.868,792000
+#
+# The first header cell is the time zone the stamps were exported in; every
+# stamp carries its UTC offset, so no --tz is needed. One file holds ONE side
+# of the quote, and only its name says which: "_BID_" or "_ASK_". The same
+# header heads a bar file ("_1Minute_", "_1Hour_", "_1Day_") and a tick file
+# ("_1Tick_", every row's open, high, low and close one price); only the name
+# tells them apart too.
+#
+# A one-sided file has no spread. Its bars and ticks are written with
+# bid = ask, which the backtest reads as "no quote", so a run on them charges
+# the spread set for the run; the conversion says so, and which side it read.
+# The Volume column is read into each bar and tick (key "volume"). Dukascopy's
+# sizes are quoted sizes, not traded volume.
+
+#: The name of a web export: symbol, size and unit of a bar (or "Tick"), side.
+_RE_DUKA_WEB_NAME = re.compile(
+    r"_(\d+)(tick|ticks|second|seconds|minute|minutes|hour|hours|day|days|week|weeks|"
+    r"month|months)_(bid|ask)_", re.IGNORECASE)
+
+_DUKA_WEB_UNIT_MINUTES = {"minute": 1, "minutes": 1, "hour": 60, "hours": 60,
+                          "day": 1440, "days": 1440}
+
+
+def _is_zone_header(cell: str) -> bool:
+    """True for the first header cell of a web export: a time zone name
+    ("Etc/UTC", "Europe/Berlin") or UTC / GMT."""
+    cell = cell.strip().strip('"').lower()
+    return cell in ("utc", "gmt") or bool(re.fullmatch(r"[a-z_]+(?:/[a-z0-9_+\-]+)+", cell))
+
+
+def _is_duka_web_header(cells: List[str]) -> bool:
+    """The header row of a web export: a zone, then open, high, low, close
+    (and the volume)."""
+    hdrs = [c.lstrip("﻿").strip().strip('"').lower() for c in cells]
+    return (len(hdrs) >= 5 and _is_zone_header(hdrs[0])
+            and hdrs[1:5] == ["open", "high", "low", "close"])
+
+
+class DukaWebExport(NamedTuple):
+    """What a web export's file name says: ticks or bars of how many minutes
+    (0 for ticks, None when the name does not say), and the quote side
+    ("bid", "ask", or None when the name does not say)."""
+    ticks: bool
+    bar_minutes: Optional[int]
+    side: Optional[str]
+    size_text: str
+
+
+def duka_web_export_name(path: str) -> DukaWebExport:
+    """Read a web export's file name. A name without the export's pattern (a
+    renamed file) says nothing: bars of the requested timeframe, side unknown."""
+    m = _RE_DUKA_WEB_NAME.search(os.path.basename(path))
+    if not m:
+        return DukaWebExport(False, None, None, "")
+    count, unit, side = int(m.group(1)), m.group(2).lower(), m.group(3).lower()
+    text = "%d %s" % (count, unit)
+    if unit.startswith("tick"):
+        return DukaWebExport(True, 0, side, text)
+    per = _DUKA_WEB_UNIT_MINUTES.get(unit)
+    if per is None:
+        # seconds (no BAR6 timeframe is shorter than a minute), weeks, months
+        raise ValueError(
+            f"{os.path.basename(path)} holds bars of {text}. A bar file holds bars of one "
+            f"of {', '.join(str(t) for t in TIMEFRAMES)} minutes; export the data "
+            f"from Dukascopy again in one of those sizes, or as ticks.")
+    return DukaWebExport(False, count * per, side, text)
+
+
+class StampWithoutOffset(ValueError):
+    """A web export's time without its UTC offset: the conversion stops."""
+
+
+def default_output_name(input_path: str, symbol: str, tf, as_ticks: bool = False) -> str:
+    """The output name the window offers: SYMBOL_M5.bin, SYMBOL_TICKS.bin; for
+    a one-sided web export the side as well (SYMBOL_ASK_M1.bin), so that the
+    BID and the ASK file of one symbol are not offered one name."""
+    try:
+        side = duka_web_export_name(input_path).side
+    except ValueError:
+        side = None
+    stem = f"{symbol}_{side.upper()}" if side else symbol
+    return f"{stem}_TICKS.bin" if as_ticks else f"{stem}_M{tf}.bin"
+
+
+def _duka_web_stamp(field: str) -> int:
+    """A web export's stamp, which carries its offset ("+00:00") or a "Z":
+    Unix milliseconds, or 0 when it cannot be read. A stamp without an offset
+    raises StampWithoutOffset: the instant it names is not known."""
+    s = field.strip()
+    try:
+        if s.endswith("Z"):
+            return int(_iso_datetime(s[:-1]).replace(tzinfo=timezone.utc).timestamp() * 1000)
+        dt = _iso_datetime(s)
+    except ValueError:
+        return 0
+    if dt.tzinfo is None:
+        raise StampWithoutOffset(
+            f"The time {s!r} carries no UTC offset, so the instant it names is not known. "
+            f"Dukascopy's web export writes every time with its offset (for example "
+            f"2026-10-28T08:00:00+00:00).")
+    return int(dt.timestamp() * 1000)
+
+
+def _read_duka_web_rows(path: str):
+    """The rows of a web export as (line, ts, open, high, low, close, volume),
+    and the number of rows that could not be read."""
+    end = _ParseEnd()
+    rows = list(_duka_web_rows(path, end))
+    return rows, end.skipped
+
+
+def _duka_web_rows(path: str, end: _ParseEnd) -> Iterator[tuple]:
+    """_read_duka_web_rows's rows, one at a time; the skipped rows go to `end`."""
+    with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
+        reader = csv.reader(f)
+        header = None
+        skipped = 0
+        for raw in reader:
+            if not any(c.strip() for c in raw):
+                continue
+            if header is None:
+                if not _is_duka_web_header(raw):
+                    raise ValueError(
+                        f"{os.path.basename(path)} does not start with the web export's header "
+                        f"(a time zone, then Open, High, Low, Close, Volume); it starts with "
+                        f"{raw!r}")
+                header = _bar_columns([c.strip().strip('"').lower() for c in raw])
+                header["date"] = 0
+                continue
+            try:
+                ts = _duka_web_stamp(raw[0])
+                vals = [float(raw[header[k]]) for k in ("open", "high", "low", "close")]
+                vol_col = header["volume"]
+                vol = float(raw[vol_col]) if 0 <= vol_col < len(raw) else None
+            except StampWithoutOffset:
+                raise
+            except (ValueError, IndexError):
+                skipped += 1
+                continue
+            if not ts:
+                skipped += 1
+                continue
+            yield (reader.line_num, ts, vals[0], vals[1], vals[2], vals[3], vol)
+    if header is None:
+        raise ValueError("File appears empty")
+    end.skipped = skipped
+
+
+def _say_side(progress: ProgressFn, stats, export: DukaWebExport) -> None:
+    """The lines a one-sided conversion owes its user: which side it read, and
+    that the spread is not in the file."""
+    side = export.side.upper() if export.side else None
+    if stats is not None:
+        try:
+            stats.quote_side = export.side
+        except AttributeError:
+            pass
+    if not progress:
+        return
+    if side:
+        progress(f"  Prices: the {side} side only (from the file name). A file of one side "
+                 f"holds no spread: the file is written with bid = ask, and a backtest on "
+                 f"it charges the spread set for the run.")
+    else:
+        progress("  Prices: one side of the quote; the file name does not say which (the "
+                 "export names it _BID_ or _ASK_). A file of one side holds no spread: the "
+                 "file is written with bid = ask, and a backtest on it charges the spread "
+                 "set for the run.")
+
+
+def parse_dukascopy_web_ticks(path: str, progress: ProgressFn = None,
+                              tz: Optional[tzinfo] = None,
+                              stats: Optional[Dict[str, int]] = None) -> List[Dict]:
+    """The ticks of a web export's tick file ("_1Tick_"), in arrival order:
+    each row's close as both bid and ask (one side, see above), its volume
+    read along. `tz` is accepted like every tick parser's and never used: the
+    stamps carry their offset."""
+    return _collect_ticks(_duka_web_ticks, path, progress, tz, stats)
+
+
+def _duka_web_ticks(path: str, progress: ProgressFn, tz: Optional[tzinfo],
+                    stats: Optional[Dict[str, int]], end: _ParseEnd) -> Iterator[Dict]:
+    """parse_dukascopy_web_ticks's ticks, one at a time."""
+    export = duka_web_export_name(path)
+    if export.bar_minutes:
+        raise ValueError(
+            f"{os.path.basename(path)} holds bars of {export.size_text}, not ticks. "
+            f"Convert it to bars (without --ticks).")
+    _mark_tick_source(stats)
+    count = 0
+    for line, ts, _o, _h, _l, c, vol in _duka_web_rows(path, end):
+        tick = {"ts": ts, "bid": c, "ask": c}
+        if vol is not None:
+            tick["volume"] = vol
+        _audit(stats, tick, line, tick=True)
+        count += 1
+        yield tick
+    if progress:
+        progress(f"  Loaded {count:,} web export ticks ({end.skipped:,} skipped)")
+    _say_side(progress, stats, export)
+
+
+def parse_dukascopy_web(path: str, tf_min: int, progress: ProgressFn = None,
+                        tz: Optional[tzinfo] = None,
+                        stats: Optional[Dict[str, int]] = None) -> List[Bar]:
+    """Dukascopy's web export: a bar file read as the bars it holds, a tick
+    file ("_1Tick_") aggregated into bars of `tf_min` minutes.
+
+    A bar file whose name gives its bar size is converted to that size only:
+    asked for another timeframe it is refused (DataConvert does not resample
+    bars). Prices are one side of the quote, written with bid = ask = close."""
+    export = duka_web_export_name(path)
+    if export.ticks:
+        ticks = parse_dukascopy_web_ticks(path, progress, stats=stats)
+        if progress:
+            progress(f"  Aggregating {len(ticks):,} ticks -> M{tf_min} bars")
+        return aggregate_ticks(ticks, tf_min)
+    if export.bar_minutes is not None and export.bar_minutes != tf_min:
+        raise ValueError(
+            f"{os.path.basename(path)} holds bars of {export.size_text} "
+            f"(M{export.bar_minutes}), so the timeframe must be {export.bar_minutes}; "
+            f"got {tf_min}. DataConvert writes the bars a file holds and does not "
+            f"combine them into longer ones.")
+    rows, skipped = _read_duka_web_rows(path)
+    bars: List[Bar] = []
+    for line, ts, o, h, l, c, vol in rows:
+        bar = _make_bar(ts, o, h, l, c)
+        if vol is not None:
+            bar["volume"] = vol
+        bars.append(bar)
+        _audit(stats, bar, line)
+    if progress:
+        progress(f"  Loaded {len(bars):,} web export bars ({skipped:,} skipped)")
+    _say_side(progress, stats, export)
+    return _measure_and_sort(bars, stats, skipped)
 
 
 # ── Tick exports of other platforms ──────────────────────────────────────────
@@ -1419,44 +1933,50 @@ class _QuoteTape:
     """One file's ticks, built row by row with the quote carried forward."""
 
     def __init__(self, stats):
-        self.ticks: List[Dict] = []
+        self.count = 0
         self.skipped = 0
         self.unpriced = 0         # rows before the first complete quote
         self.bid: Optional[float] = None
         self.ask: Optional[float] = None
         self._stats = stats
 
-    def add(self, ts: int, bid_field: str, ask_field: str, line: int) -> None:
-        """Add one row: `ts` (0 when its time could not be read) and its two
-        quote fields as written in the file."""
+    def add(self, ts: int, bid_field: str, ask_field: str, line: int,
+            volume: Optional[float] = None) -> Optional[Dict]:
+        """One row: `ts` (0 when its time could not be read), its two quote
+        fields as written in the file and, when the source has a volume
+        column, the row's volume. Returns the row's tick, or None when the
+        row gives none."""
         if not ts:
             self.skipped += 1
-            return
+            return None
         try:
             bid = _quote_side(bid_field, self.bid)
             ask = _quote_side(ask_field, self.ask)
         except ValueError:
             self.skipped += 1
-            return
+            return None
         self.bid, self.ask = bid, ask
         if bid is None or ask is None:
             self.skipped += 1
             self.unpriced += 1
-            return
-        self.ticks.append({"ts": ts, "bid": bid, "ask": ask})
-        _audit(self._stats, self.ticks[-1], line, tick=True)
+            return None
+        tick = {"ts": ts, "bid": bid, "ask": ask}
+        if volume is not None:
+            tick["volume"] = volume
+        _audit(self._stats, tick, line, tick=True)
+        self.count += 1
+        return tick
 
     def finish(self, path: str, what: str, clock: SourceClock,
-               progress: ProgressFn) -> List[Dict]:
+               progress: ProgressFn, end: _ParseEnd) -> None:
         clock.refuse_nonexistent(path)
-        _record(self._stats, self.ticks, self.skipped, clock)
+        end.skipped, end.clock = self.skipped, clock
         if progress:
-            progress(f"  Loaded {len(self.ticks):,} {what} ticks "
+            progress(f"  Loaded {self.count:,} {what} ticks "
                      f"({self.skipped:,} skipped)")
             if self.unpriced:
                 progress(f"  {self.unpriced:,} of the skipped rows came before the "
                          f"file had quoted both a bid and an ask")
-        return self.ticks
 
 
 def _header_index(hdrs: List[str], *names: str) -> int:
@@ -1505,6 +2025,12 @@ def parse_mt5_ticks(path: str, progress: ProgressFn = None,
     are found by their header names; a file without the header is read in the
     export's order (date, time, bid, ask).
     """
+    return _collect_ticks(_mt5_ticks, path, progress, tz, stats)
+
+
+def _mt5_ticks(path: str, progress: ProgressFn, tz: Optional[tzinfo],
+               stats: Optional[Dict[str, int]], end: _ParseEnd) -> Iterator[Dict]:
+    """parse_mt5_ticks's ticks, one at a time."""
     tape = _QuoteTape(stats)
     clock = SourceClock(tz, repeats=True)       # ticks: see SourceClock, TICKS
     with open(path, newline="", encoding="utf-8", errors="replace") as f:
@@ -1518,21 +2044,34 @@ def parse_mt5_ticks(path: str, progress: ProgressFn = None,
                 continue
             if cols is None:
                 hdrs = [h.upper() for h in row]
-                cols = (0, 1, 2, 3)
+                cols = (0, 1, 2, 3, -1)
                 if "BID" in hdrs and "ASK" in hdrs:
+                    # The traded volume: <VOLUME_REAL> where the export has it,
+                    # else <VOLUME>. A quote tick's cell is empty: 0.
+                    vol = ("VOLUME_REAL" if "VOLUME_REAL" in hdrs else
+                           "VOLUME" if "VOLUME" in hdrs else None)
                     cols = (hdrs.index("DATE") if "DATE" in hdrs else 0,
                             hdrs.index("TIME") if "TIME" in hdrs else -1,
-                            hdrs.index("BID"), hdrs.index("ASK"))
+                            hdrs.index("BID"), hdrs.index("ASK"),
+                            hdrs.index(vol) if vol else -1)
                     continue
-            d, t, b, a = cols
+            d, t, b, a, v = cols
             try:
                 ts = parse_ts(row[d], row[t] if 0 <= t < len(row) else "", tz, clock,
                               fraction=True)
             except (ValueError, IndexError):
                 ts = 0
-            tape.add(ts, row[b] if b < len(row) else "", row[a] if a < len(row) else "",
-                     reader.line_num)
-    return tape.finish(path, "MT5", clock, progress)
+            try:
+                volume = (_volume_cell(row[v] if v < len(row) else "", empty=0.0)
+                          if v >= 0 else None)
+            except ValueError:
+                tape.skipped += 1
+                continue
+            tick = tape.add(ts, row[b] if b < len(row) else "", row[a] if a < len(row) else "",
+                            reader.line_num, volume)
+            if tick is not None:
+                yield tick
+    tape.finish(path, "MT5", clock, progress, end)
 
 
 #: A NinjaTrader tick stamp: date, time and the fraction in 100 ns steps.
@@ -1550,6 +2089,12 @@ def parse_ninjatrader_ticks(path: str, progress: ProgressFn = None,
     by ; (or ,). The fraction is in 100-nanosecond steps (1230000 = 0.123 s).
     The time is the zone set in NinjaTrader, so --tz is required.
     """
+    return _collect_ticks(_ninjatrader_ticks, path, progress, tz, stats)
+
+
+def _ninjatrader_ticks(path: str, progress: ProgressFn, tz: Optional[tzinfo],
+                       stats: Optional[Dict[str, int]], end: _ParseEnd) -> Iterator[Dict]:
+    """parse_ninjatrader_ticks's ticks, one at a time."""
     tape = _QuoteTape(stats)
     clock = SourceClock(tz, repeats=True)       # ticks: see SourceClock, TICKS
     with open(path, newline="", encoding="utf-8", errors="replace") as f:
@@ -1572,8 +2117,15 @@ def parse_ninjatrader_ticks(path: str, progress: ProgressFn = None,
                                tz, clock)
                 except ValueError:
                     ts = 0
-            tape.add(ts, row[2] if m else "", row[3] if m else "", reader.line_num)
-    return tape.finish(path, "NinjaTrader", clock, progress)
+            try:      # the volume, the trade's size: the field after the ask
+                volume = _volume_cell(row[4]) if m and len(row) > 4 else None
+            except ValueError:
+                tape.skipped += 1
+                continue
+            tick = tape.add(ts, row[2] if m else "", row[3] if m else "", reader.line_num, volume)
+            if tick is not None:
+                yield tick
+    tape.finish(path, "NinjaTrader", clock, progress, end)
 
 
 def parse_generic_ticks(path: str, progress: ProgressFn = None,
@@ -1593,6 +2145,12 @@ def parse_generic_ticks(path: str, progress: ProgressFn = None,
     DataConvert reads works, fractions of a second included; a wall clock needs
     --tz, a Unix time in seconds or milliseconds is an instant already.
     """
+    return _collect_ticks(_generic_ticks, path, progress, tz, stats)
+
+
+def _generic_ticks(path: str, progress: ProgressFn, tz: Optional[tzinfo],
+                   stats: Optional[Dict[str, int]], end: _ParseEnd) -> Iterator[Dict]:
+    """parse_generic_ticks's ticks, one at a time."""
     tape = _QuoteTape(stats)
     clock = SourceClock(tz, repeats=True)       # ticks: see SourceClock, TICKS
     with open(path, newline="", encoding="utf-8", errors="replace") as f:
@@ -1613,26 +2171,45 @@ def parse_generic_ticks(path: str, progress: ProgressFn = None,
                     raise ValueError(
                         "A tick CSV needs a header row naming its time, bid and ask "
                         f"columns; this one has {row!r}")
-                cols = (d, t if t != d else -1, b, a)
+                cols = (d, t if t != d else -1, b, a, _bar_columns(hdrs)["volume"])
                 continue
-            d, t, b, a = cols
+            d, t, b, a, v = cols
             try:
                 ts = parse_ts(row[d], row[t] if 0 <= t < len(row) else "", tz, clock,
                               fraction=True)
             except (ValueError, IndexError):
                 ts = 0
-            tape.add(ts, row[b] if b < len(row) else "", row[a] if a < len(row) else "",
-                     reader.line_num)
-    return tape.finish(path, "CSV", clock, progress)
+            try:      # a column headed exactly "volume" or "vol"
+                volume = _volume_cell(row[v] if v < len(row) else "") if v >= 0 else None
+            except ValueError:
+                tape.skipped += 1
+                continue
+            tick = tape.add(ts, row[b] if b < len(row) else "", row[a] if a < len(row) else "",
+                            reader.line_num, volume)
+            if tick is not None:
+                yield tick
+    tape.finish(path, "CSV", clock, progress, end)
 
 
 #: Every input format whose rows are quotes: its tick parser. These formats can
-#: write raw ticks (--ticks), and their bars keep the quoted spread.
+#: write raw ticks (--ticks), and their bars keep the quoted spread. The web
+#: export's tick file is one side of the quote: its ticks have no spread.
 TICK_PARSERS: Dict[str, Callable[..., List[Dict]]] = {
     "dukascopy":        parse_dukascopy_ticks,
+    "dukascopyweb":     parse_dukascopy_web_ticks,
     "mt5ticks":         parse_mt5_ticks,
     "ninjatraderticks": parse_ninjatrader_ticks,
     "genericticks":     parse_generic_ticks,
+}
+
+#: The same parsers, one tick at a time: what a conversion streams (see
+#: "Streaming"). Each takes (path, progress, tz, stats, end).
+TICK_STREAMS: Dict[str, Callable[..., Iterator[Dict]]] = {
+    "dukascopy":        _dukascopy_ticks,
+    "dukascopyweb":     _duka_web_ticks,
+    "mt5ticks":         _mt5_ticks,
+    "ninjatraderticks": _ninjatrader_ticks,
+    "genericticks":     _generic_ticks,
 }
 
 
@@ -1641,6 +2218,7 @@ def _bars_from_ticks(tick_parser: Callable[..., List[Dict]], what: str):
     def parse(path: str, tf_min: int, progress: ProgressFn = None,
               tz: Optional[tzinfo] = None,
               stats: Optional[Dict[str, int]] = None) -> List[Bar]:
+        _mark_tick_source(stats)
         ticks = tick_parser(path, progress, tz=tz, stats=stats)
         if progress:
             progress(f"  Aggregating {len(ticks):,} ticks -> M{tf_min} bars")
@@ -1657,6 +2235,14 @@ parse_generic_tick_bars = _bars_from_ticks(parse_generic_ticks, "genericticks")
 
 def _make_bar(ts: int, o: float, h: float, l: float, c: float) -> Bar:
     return {"ts": ts, "open": o, "high": h, "low": l, "close": c, "bid": c, "ask": c}
+
+
+def _volume_cell(field: str, empty: float = math.nan) -> float:
+    """A volume cell as written. An empty cell is `empty`: not a number by
+    default, so the row is refused and named (see "Volume" below); MT5's quote
+    ticks, whose volume cell is empty by design, pass 0."""
+    field = field.strip()
+    return float(field) if field else empty
 
 
 # ── A spread per bar (MT4/MT5) ───────────────────────────────────────────────
@@ -1725,6 +2311,7 @@ def parse_mt4(path: str, tf_min: int, progress: ProgressFn = None,
         reader = csv.reader(f, delimiter=delim)
         date_col, time_col, o_col, h_col, l_col, c_col = 0, 1, 2, 3, 4, 5
         sp_col = -1
+        vol_col = -1          # <VOL>, the real volume; never <TICKVOL> (price changes)
         for i, raw in enumerate(reader):
             row = [c.strip().strip("<>\"") for c in raw if raw]
             if not row:
@@ -1746,6 +2333,7 @@ def parse_mt4(path: str, tf_min: int, progress: ProgressFn = None,
                         elif h == "LOW":    l_col    = ci
                         elif h == "CLOSE":  c_col    = ci
                         elif h == "SPREAD": sp_col   = ci
+                        elif h == "VOL":    vol_col  = ci
                     continue
             if len(row) <= max(o_col, h_col, l_col, c_col, sp_col):
                 skipped += 1
@@ -1758,6 +2346,8 @@ def parse_mt4(path: str, tf_min: int, progress: ProgressFn = None,
                     continue
                 prices = [row[o_col], row[h_col], row[l_col], row[c_col]]
                 bar = _make_bar(ts, *(float(p) for p in prices))
+                if vol_col >= 0:
+                    bar["volume"] = _volume_cell(row[vol_col] if vol_col < len(row) else "")
                 if sp_col >= 0:
                     spread = float(row[sp_col])
                     if not spread >= 0:
@@ -1854,8 +2444,9 @@ def parse_mt4hst(path: str, tf_min: int, progress: ProgressFn = None,
         FMT, SZ = "<qddddQiQ", 60
         n = len(data) // SZ
         for i in range(n):
-            time_s, o, high, low, c, _tv, sp, _rv = struct.unpack_from(FMT, data, i * SZ)
+            time_s, o, high, low, c, _tv, sp, real_vol = struct.unpack_from(FMT, data, i * SZ)
             bars.append(_make_bar(_ctm_to_utc_ms(time_s), o, high, low, c))
+            bars[-1]["volume"] = float(real_vol)     # never tick_vol (price changes)
             if unit is not None and sp > 0:
                 _with_spread(bars[-1], sp * unit)
             _audit(stats, bars[-1], i + 1, unit="record")
@@ -1878,6 +2469,7 @@ def parse_tradingview(path: str, tf_min: int, progress: ProgressFn = None,
     """
     bars: List[Bar] = []
     skipped = 0
+    vol_col = -1      # the column headed exactly "volume"; an export without a header has none
     with open(path, newline="", encoding="utf-8", errors="replace") as f:
         reader = csv.reader(f)
         for i, row in enumerate(reader):
@@ -1885,6 +2477,7 @@ def parse_tradingview(path: str, tf_min: int, progress: ProgressFn = None,
                 continue
             row = [c.strip() for c in row]
             if i == 0 and row[0].lower() in ("time", "date", "timestamp"):
+                vol_col = _bar_columns([c.lower() for c in row])["volume"]
                 continue
             if len(row) < 5:
                 skipped += 1
@@ -1894,6 +2487,8 @@ def parse_tradingview(path: str, tf_min: int, progress: ProgressFn = None,
                 ts = int(t * 1000) if t < 1e12 else int(t)
                 bars.append(_make_bar(ts, float(row[1]), float(row[2]),
                                       float(row[3]), float(row[4])))
+                if vol_col >= 0:
+                    bars[-1]["volume"] = _volume_cell(row[vol_col] if vol_col < len(row) else "")
                 _audit(stats, bars[-1], reader.line_num)
             except ValueError:
                 skipped += 1
@@ -1955,6 +2550,8 @@ def parse_ninjatrader(path: str, tf_min: int, progress: ProgressFn = None,
                     continue
                 bars.append(_make_bar(ts, float(row[ci]), float(row[ci+1]),
                                       float(row[ci+2]), float(row[ci+3])))
+                if len(row) > ci + 4:          # the volume, the field after close
+                    bars[-1]["volume"] = _volume_cell(row[ci + 4])
                 _audit(stats, bars[-1], reader.line_num)
             except (ValueError, IndexError):
                 skipped += 1
@@ -2056,6 +2653,8 @@ def parse_binance(path: str, tf_min: int, progress: ProgressFn = None,
                     float(row[3]),  # low
                     float(row[4]),  # close
                 ))
+                if len(row) > 5:
+                    bars[-1]["volume"] = _volume_cell(row[5])   # base asset volume
                 _audit(stats, bars[-1], reader.line_num)
             except (ValueError, IndexError):
                 skipped += 1
@@ -2104,6 +2703,7 @@ def parse_bybit(path: str, tf_min: int, progress: ProgressFn = None,
 
         # Column index defaults (positional)
         ts_col, o_col, h_col, l_col, c_col = 0, 1, 2, 3, 4
+        vol_col = -1      # by its exact header name only, never by position
         has_header = False
 
         for i, raw in enumerate(reader):
@@ -2136,6 +2736,7 @@ def parse_bybit(path: str, tf_min: int, progress: ProgressFn = None,
                     if any(c < 0 for c in [ts_col, o_col, h_col, l_col, c_col]):
                         # Fall back to positional
                         ts_col, o_col, h_col, l_col, c_col = 0, 1, 2, 3, 4
+                    vol_col = _bar_columns(hdrs)["volume"]
                     continue
 
             if len(row) <= max(ts_col, o_col, h_col, l_col, c_col):
@@ -2160,6 +2761,8 @@ def parse_bybit(path: str, tf_min: int, progress: ProgressFn = None,
                     float(row[l_col]),
                     float(row[c_col]),
                 ))
+                if vol_col >= 0:
+                    bars[-1]["volume"] = _volume_cell(row[vol_col] if vol_col < len(row) else "")
                 _audit(stats, bars[-1], reader.line_num)
             except (ValueError, IndexError):
                 skipped += 1
@@ -2176,7 +2779,10 @@ def parse_generic(path: str, tf_min: int, progress: ProgressFn = None,
                   stats: Optional[Dict[str, int]] = None) -> List[Bar]:
     """
     Auto-detect OHLCV CSV.  Tries column name matching first, then positional.
-    Falls back to Dukascopy tick parser if columns can't be resolved.
+    Falls back to the Dukascopy tick parser when the file shows no bar layout
+    (a header naming no open, high, low and close columns, or fewer than five
+    columns without a header). A header that names the four prices but no time
+    column is refused.
 
     col_map  optional manual override: {'date': 0, 'time': 1, 'open': 2, ...}
     Column indices are 0-based; 'time' may be -1 if combined with date.
@@ -2203,6 +2809,7 @@ def parse_generic(path: str, tf_min: int, progress: ProgressFn = None,
         h_col    = col_map.get("high",  -1)
         l_col    = col_map.get("low",   -1)
         c_col    = col_map.get("close", -1)
+        v_col    = col_map.get("volume", -1)
         # Skip header row if first row looks non-numeric
         first_date = (rows[0][date_col].strip() if date_col < len(rows[0]) else "")
         data_rows = rows[1:] if re.search(r"[a-zA-Z]", first_date) else rows
@@ -2212,30 +2819,27 @@ def parse_generic(path: str, tf_min: int, progress: ProgressFn = None,
         has_header = any(re.search(r"[a-z]", h) for h in raw_hdr)
 
         if has_header:
-            def find(*names) -> int:
-                # An exact header name beats one that merely contains it:
-                # "open" is the price column, not "open_time".
-                for n in names:
-                    for ci, h in enumerate(raw_hdr):
-                        if n == h:
-                            return ci
-                    for ci, h in enumerate(raw_hdr):
-                        if n in h:
-                            return ci
-                return -1
-            date_col = find("date", "datetime", "timestamp", "time")
-            time_col = find("time")
-            if time_col == date_col:
-                time_col = -1
-            o_col = find("open")
-            h_col = find("high")
-            l_col = find("low")
-            c_col = find("close")
+            cols = _bar_columns(raw_hdr)
+            date_col, time_col = cols["date"], cols["time"]
+            o_col, h_col, l_col, c_col = cols["open"], cols["high"], cols["low"], cols["close"]
+            v_col = cols["volume"]
+            # A header that names the four prices is a bar file. Read
+            # by the tick parser it became wrong bars (open read as the ask,
+            # high as the bid) and a successful conversion; without a time
+            # column it is refused instead.
+            if date_col < 0 and min(o_col, h_col, l_col, c_col) >= 0:
+                raise ValueError(
+                    f"The header names open, high, low and close columns but no time "
+                    f"column ({', '.join(raw_hdr)}). Name the time column date, time, "
+                    f"datetime or timestamp, or choose the columns by hand.")
             data_rows = rows[1:]
         else:
             # Positional: date [time] open high low close [volume ...]
+            v_col = -1
             if len(rows[0]) >= 6:
                 date_col, time_col, o_col, h_col, l_col, c_col = 0, 1, 2, 3, 4, 5
+                if len(rows[0]) >= 7:
+                    v_col = 6          # the column after close
             elif len(rows[0]) >= 5:
                 date_col, time_col, o_col, h_col, l_col, c_col = 0, -1, 1, 2, 3, 4
             else:
@@ -2262,6 +2866,8 @@ def parse_generic(path: str, tf_min: int, progress: ProgressFn = None,
                 continue
             bars.append(_make_bar(ts, float(row[o_col]), float(row[h_col]),
                                   float(row[l_col]), float(row[c_col])))
+            if v_col >= 0:
+                bars[-1]["volume"] = _volume_cell(row[v_col] if v_col < len(row) else "")
             _audit(stats, bars[-1], line_of[first_data + k])
         except (ValueError, IndexError):
             skipped += 1
@@ -2276,6 +2882,8 @@ def parse_generic(path: str, tf_min: int, progress: ProgressFn = None,
 # =============================================================================
 FORMATS: Dict[str, tuple] = {
     "dukascopy":    (parse_dukascopy,    "Dukascopy tick CSV  (LocalTime,Ask,Bid,AskVolume,BidVolume)"),
+    "dukascopyweb": (parse_dukascopy_web,
+                     "Dukascopy web export  (Etc/UTC,Open,High,Low,Close,Volume; bars, or ticks of one side)"),
     "mt5ticks":     (parse_mt5_tick_bars, "MT5 tick export  (<DATE> <TIME> <BID> <ASK> <LAST> <VOLUME> <FLAGS>)"),
     "ninjatraderticks": (parse_ninjatrader_tick_bars,
                      "NinjaTrader tick export  (yyyyMMdd HHmmss fffffff;last;bid;ask;volume)"),
@@ -2319,6 +2927,9 @@ def detect_format(path: str) -> str:
             lines = [f.readline() for _ in range(4)]
         sample = " ".join(lines).lower()
 
+        # Dukascopy's web export: a time zone, then Open, High, Low, Close.
+        if _is_duka_web_header(lines[0].strip().split(",")):
+            return "dukascopyweb"
         if "localtime" in sample or re.search(r"\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}:\d{2}\.\d+", sample):
             return "dukascopy"
         # An MT5 tick export: the bar export's <DATE> header with <BID> and <ASK>.
@@ -2334,6 +2945,18 @@ def detect_format(path: str) -> str:
         if (_quote_column(head, "bid") >= 0 and _quote_column(head, "ask") >= 0
                 and not any(h in ("open", "close") for h in head)):
             return "genericticks"
+        # Binance and Bybit with their header "open_time,open,...". Tested before
+        # TradingView, whose "time,open,high,low,close" matches inside it: a
+        # Bybit export used to be read as TradingView, its header counted as an
+        # unreadable row and its volume column not found.
+        if re.search(r"open_time,open,high,low,close", sample.replace(" ", "")):
+            # Bybit uses Unix seconds, Binance uses ms
+            # Distinguish by first data value: Binance ms = 13 digits
+            for ln in lines[1:]:
+                if ln.strip() and ln.strip()[0].isdigit():
+                    first_val = ln.split(",")[0].strip()
+                    return "binance" if len(first_val) >= 13 else "bybit"
+            return "binance"
         # TradingView: first column is "time" (Unix seconds), no separate "date" column
         if (re.search(r"time,open,high,low,close", sample.replace(" ", ""))
                 and not re.search(r"\bdate\b", sample[:200].lower())):
@@ -2346,17 +2969,6 @@ def detect_format(path: str) -> str:
             return "ninjatrader"
         if re.search(r'"date".*"time".*"open"', sample):
             return "tradestation"
-
-        # Binance: first data row has a 13-digit ms timestamp, or header is "open_time,..."
-        # and there are ≥ 6 columns
-        if re.search(r"open_time,open,high,low,close", sample.replace(" ", "")):
-            # Bybit uses Unix seconds, Binance uses ms
-            # Distinguish by first data value: Binance ms = 13 digits
-            for ln in lines[1:]:
-                if ln.strip() and ln.strip()[0].isdigit():
-                    first_val = ln.split(",")[0].strip()
-                    return "binance" if len(first_val) >= 13 else "bybit"
-            return "binance"
 
         # Binance without header: 12-column CSV with large ms timestamp
         for ln in lines:
@@ -2394,14 +3006,28 @@ def _refuse_audited_with_counts(stats, output_path: str, progress: ProgressFn,
 
 # ── Memory a conversion needs ───────────────────────────────────────────────
 #
-# Every parser holds all rows of the input in memory before anything is
-# written (sorting by time needs the whole list). Measured with Python 3.13 on
-# Dukascopy tick files of half a million, one and two million rows, for bar and
-# tick output alike: about 313 MB per million rows, on top of about 20 MB for
-# Python itself, roughly 13 times the size of a tick CSV. A year of EUR-USD
-# ticks (about 28 million rows) needs about 8.6 GB, a year of BTC ticks (about
-# 47 million) about 15 GB. MB and GB here are 10^6 and 10^9 bytes.
-MEMORY_MB_PER_MILLION_ROWS = 313
+# A tick source streams (see "Streaming" below): its conversion needs at most
+# STREAMING_MEMORY_MB, whatever the size of the file.
+#
+# A bar source is held in memory: its parser builds every row before anything
+# is written (sorting by time needs the whole list), and what a row costs
+# depends on the parser. Measured with Python 3.13 on Windows (peak working set
+# of a fresh process, MB of 10^6 bytes, one-minute bars with volume), per
+# million rows on top of about 20 MB for Python itself:
+#
+#   tradingview 497, tradestation 463, ninjatrader 496, binance 496, bybit 496,
+#   mt4 640, mt5 642, mt4hst 678, dukascopyweb 634, generic 1,124
+#
+# linear in the rows (two million: mt4 638, dukascopyweb 630, generic 1,120).
+# BAR_MB_PER_MILLION_ROWS holds them with 5 % added, rounded up to 10 MB. MB
+# and GB here are 10^6 and 10^9 bytes.
+BAR_MB_PER_MILLION_ROWS: Dict[str, int] = {
+    "tradingview": 530, "tradestation": 490, "ninjatrader": 530, "binance": 530,
+    "bybit": 530, "mt4": 680, "mt5": 680, "mt4hst": 720, "dukascopyweb": 670,
+    "generic": 1180,
+}
+#: The figure for a format without one of its own: the largest.
+MEMORY_MB_PER_MILLION_ROWS = max(BAR_MB_PER_MILLION_ROWS.values())
 MEMORY_BASE_MB = 20
 _ROW_SAMPLE_BYTES = 1 << 20      # the first MiB of a text file gives its mean row length
 
@@ -2412,17 +3038,28 @@ class NotEnoughMemory(Exception):
     Raised before the input is parsed, so nothing is written. Carries `rows`,
     `need_mb`, `available_mb` and `reason`: the message without the
     command-line switch, for the GUI, which asks "Convert anyway?" instead.
+    `streaming`: the input is a tick file, whose need is the ceiling.
+    `fmt`: the bar format, whose figure per million rows the message names.
     """
 
-    def __init__(self, rows: int, need_mb: float, available_mb: float):
+    def __init__(self, rows: int, need_mb: float, available_mb: float,
+                 streaming: bool = False, fmt: Optional[str] = None):
         self.rows, self.need_mb, self.available_mb = rows, need_mb, available_mb
-        reason = (
-            f"This file has about {rows:,} rows. Converting it needs about "
-            f"{memory_text(need_mb)} of memory, and about {memory_text(available_mb)} "
-            f"is available on this computer. DataConvert holds every row in memory "
-            f"while it converts (about {MEMORY_MB_PER_MILLION_ROWS} MB per million "
-            f"rows), so the conversion would run out of memory before it ends. A file "
-            f"that covers a shorter period needs less")
+        self.streaming = streaming
+        per_million = memory_per_million_rows(fmt)
+        if streaming:
+            reason = (
+                f"Converting a tick file needs up to about {memory_text(need_mb)} of "
+                f"memory, whatever its size, and about {memory_text(available_mb)} is "
+                f"available on this computer")
+        else:
+            reason = (
+                f"This file has about {rows:,} rows. Converting it needs about "
+                f"{memory_text(need_mb)} of memory, and about {memory_text(available_mb)} "
+                f"is available on this computer. DataConvert holds every row of a bar file "
+                f"in memory while it converts (about {per_million:,} MB per million rows "
+                f"of this format), so the conversion would run out of memory before it "
+                f"ends. A file that covers a shorter period needs less")
         self.reason = reason + "."
         super().__init__(reason + "; --ignore-memory-check starts the conversion anyway.")
 
@@ -2432,9 +3069,16 @@ def memory_text(mb: float) -> str:
     return f"{mb / 1000:.1f} GB" if mb >= 1000 else f"{mb:.0f} MB"
 
 
-def memory_estimate_mb(rows: int) -> float:
-    """The memory a conversion of `rows` rows needs, in MB (measured, see above)."""
-    return MEMORY_BASE_MB + MEMORY_MB_PER_MILLION_ROWS * rows / 1_000_000
+def memory_per_million_rows(fmt: Optional[str] = None) -> int:
+    """The memory a million rows of a bar file of `fmt` take, in MB (measured,
+    see above); the largest figure for a format without one."""
+    return BAR_MB_PER_MILLION_ROWS.get(fmt, MEMORY_MB_PER_MILLION_ROWS)
+
+
+def memory_estimate_mb(rows: int, fmt: Optional[str] = None) -> float:
+    """The memory a conversion of `rows` rows of a bar file of `fmt` needs,
+    in MB (measured, see above)."""
+    return MEMORY_BASE_MB + memory_per_million_rows(fmt) * rows / 1_000_000
 
 
 def _rows_in_text(size: int, head: bytes) -> int:
@@ -2505,19 +3149,643 @@ def available_memory_mb() -> Optional[float]:
 
 
 def check_memory(input_path: str, fmt: str, progress: ProgressFn = None,
-                 ignore: bool = False) -> Tuple[int, float, Optional[float]]:
-    """Estimate the memory the conversion needs and say it; raise
-    NotEnoughMemory when it is more than is available (unless `ignore`).
-    Returns (rows, need_mb, available_mb)."""
+                 ignore: bool = False,
+                 as_ticks: bool = False) -> Tuple[int, float, Optional[float]]:
+    """Say the memory the conversion needs; raise NotEnoughMemory when it is
+    more than is available (unless `ignore`). A conversion that streams
+    (streams()) needs STREAMING_MEMORY_MB whatever the rows; any other the
+    estimate for its rows. Returns (rows, need_mb, available_mb)."""
     rows = estimate_rows(input_path, fmt)
-    need = memory_estimate_mb(rows)
+    streaming = streams(input_path, fmt, as_ticks)
+    need = STREAMING_MEMORY_MB if streaming else memory_estimate_mb(rows, fmt)
     available = available_memory_mb()
     if progress:
-        progress(f"Memory: about {rows:,} rows, about {memory_text(need)} needed to convert"
-                 + (f" ({memory_text(available)} available)" if available is not None else ""))
+        shown = f" ({memory_text(available)} available)" if available is not None else ""
+        if streaming:
+            progress(f"Memory: about {rows:,} rows, converted in at most about "
+                     f"{memory_text(need)} of memory{shown}")
+        else:
+            progress(f"Memory: about {rows:,} rows, about {memory_text(need)} needed to "
+                     f"convert{shown}")
     if available is not None and need > available and not ignore:
-        raise NotEnoughMemory(rows, need, available)
+        raise NotEnoughMemory(rows, need, available, streaming=streaming, fmt=fmt)
     return rows, need, available
+
+
+# ── Streaming ────────────────────────────────────────────────────────────────
+#
+# A tick export holds tens or hundreds of millions of rows, and a conversion of
+# one does not hold them. Every tick goes to a scratch file of 32-byte records
+# (the layout of a tick record) as it is parsed, in the order of the file, and
+# what the conversion must know about the ticks is counted on the way. Then:
+#
+#   raw ticks   the scratch file is the output: once the ticks are known to
+#               be writable, the header goes in front of them and the file
+#               takes the output's name.
+#   bars        the ticks are read back in time order and aggregated as they
+#               come (_bars_in_order): one bar is open at a time and is
+#               written when the next one starts.
+#
+# Time order. Ticks that never go back in the file are in time order already
+# and are read back as they are. Otherwise the scratch file is sorted on disk:
+# runs of SORT_RUN_TICKS consecutive ticks are sorted in memory by time, ties
+# in file order, and written out; then the runs are merged, MERGE_FAN_IN at a
+# time, a tick of an earlier run before a tick of a later run of the same time.
+# A run holds consecutive ticks, so a merge of runs in their order is the
+# stable sort of everything they hold: the stream is exactly the list that
+# sorting all ticks by time gives, and so are the bars. A run is an artifact of
+# the sort only; the aggregation never sees one.
+#
+# Nothing is written under the output's name before the ticks have passed every
+# check: a refused conversion leaves the file that was there, and removes its
+# scratch files and any folder it made for the output. The scratch files lie
+# beside the output and need about 32 bytes per tick (twice that while ticks
+# that are not in time order are sorted).
+#
+# The memory this takes does not grow with the file. Measured with Python 3.13
+# on Windows (peak working set, MB of 10^6 bytes): about 28 MB for ticks in
+# time order, raw or as bars; about 129 MB for shuffled ticks, the same for one
+# and for two million of them, the most being one full sort run in memory.
+# Held in memory, as before, the same million ticks took 338 MB and two million
+# 652 MB. STREAMING_MEMORY_MB is the stated ceiling, with room for the window
+# (Tk) and other platforms.
+
+#: Ticks sorted in memory at once when a file's ticks are not in time order.
+SORT_RUN_TICKS = 1_000_000
+#: Sorted runs merged at once.
+MERGE_FAN_IN = 32
+#: Records read from a scratch file at a time (a merge reads its runs in
+#: blocks of STREAM_BLOCK_RECORDS / MERGE_FAN_IN).
+STREAM_BLOCK_RECORDS = 1 << 15
+#: The most memory a conversion of a tick file needs, in MB: measured (see
+#: above) with a margin.
+STREAMING_MEMORY_MB = 200
+
+_TICK_RECORD = struct.Struct(TICK_FMT)
+_BAR_RECORD = struct.Struct(BAR_FMT)
+_WRITE_BYTES = 1 << 20          # written out once a buffer holds this much
+
+
+def streams(input_path: str, fmt: Optional[str], as_ticks: bool = False) -> bool:
+    """True when converting `input_path` as `fmt` streams its ticks: every
+    tick format, except a Dukascopy web export of bars, which is read as the
+    bars it holds."""
+    if fmt not in TICK_STREAMS:
+        return False
+    if as_ticks or fmt != "dukascopyweb":
+        return True
+    try:
+        return duka_web_export_name(input_path).ticks
+    except ValueError:
+        return False
+
+
+class _Scratch:
+    """The scratch files of one conversion, beside its output, and the folders
+    made for the output. close() removes the files left in it and, after a
+    conversion that failed, those folders (when empty)."""
+
+    def __init__(self, output_path: str):
+        self.dir = os.path.dirname(os.path.abspath(output_path))
+        self._base = os.path.basename(output_path)
+        self._files: List[str] = []
+        missing, d = [], self.dir
+        while not os.path.isdir(d):
+            missing.append(d)
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        os.makedirs(self.dir, exist_ok=True)
+        self._made = missing              # deepest first
+
+    def new(self, what: str) -> str:
+        """A new, empty scratch file. Created like an output file (the
+        permissions a new file gets here), since one may become the output."""
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        while True:
+            path = os.path.join(self.dir, ".%s.%s-%d-%s.part" % (
+                self._base, what, os.getpid(), secrets.token_hex(4)))
+            try:
+                os.close(os.open(path, flags, 0o666))
+            except FileExistsError:
+                continue
+            self._files.append(path)
+            return path
+
+    def drop(self, path: str) -> None:
+        """Remove a scratch file that is no longer needed."""
+        self._files.remove(path)
+        os.remove(path)
+
+    def becomes(self, path: str, output_path: str) -> None:
+        """Give scratch file `path` the output's name."""
+        os.replace(path, output_path)
+        self._files.remove(path)
+
+    def close(self, succeeded: bool) -> None:
+        for path in self._files:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self._files = []
+        if not succeeded:
+            for d in self._made:
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    break
+
+
+class _Spilled:
+    """What the ticks of a scratch file are, counted as they were written:
+    count, earliest and latest time (lo, hi), descents (a tick earlier than
+    the one before it, the first ones in `first_descents` as the order check
+    names them), repeats (a tick at the time of the one before it), and their
+    volumes: how many carry one, whether one is not 0, whether one is -0.0,
+    how many carry none and the first of those (position, tick)."""
+
+    __slots__ = ("count", "lo", "hi", "descents", "first_descents", "repeats",
+                 "carrying", "nonzero", "negative_zero", "lacking", "first_lacking")
+
+
+def _spill_ticks(ticks: Iterator[Dict], f, missing_volume: float) -> _Spilled:
+    """Write `ticks` to the open scratch file `f` as 32-byte records, in the
+    order they come, `missing_volume` in the volume field of a tick without
+    one, and count what _Spilled says."""
+    pack = _TICK_RECORD.pack
+    buf = bytearray()
+    count = descents = repeats = carrying = lacking = 0
+    nonzero = negative_zero = False
+    first_descents: List[tuple] = []
+    first_lacking: List[Tuple[int, Dict]] = []
+    lo = hi = prev = 0
+    for tick in ticks:
+        ts = tick["ts"]
+        if count:
+            if ts < prev:
+                descents += 1
+                if len(first_descents) < 5:
+                    first_descents.append(("descent", count - 1, prev, count, ts))
+                if ts < lo:
+                    lo = ts
+            elif ts == prev:
+                repeats += 1
+            elif ts > hi:
+                hi = ts
+        else:
+            lo = hi = ts
+        prev = ts
+        volume = tick.get("volume")
+        if volume is None:
+            lacking += 1
+            if len(first_lacking) < REFUSAL_NAMES:
+                first_lacking.append((count + 1, dict(tick)))
+            volume = missing_volume
+        else:
+            carrying += 1
+            if volume != 0.0:
+                nonzero = True
+            elif math.copysign(1.0, volume) < 0.0:
+                negative_zero = True
+        buf += pack(ts, tick["bid"], tick["ask"], volume)
+        count += 1
+        if len(buf) >= _WRITE_BYTES:
+            f.write(buf)
+            buf.clear()
+    f.write(buf)
+    s = _Spilled()
+    s.count, s.lo, s.hi = count, lo, hi
+    s.descents, s.first_descents, s.repeats = descents, first_descents, repeats
+    s.carrying, s.nonzero, s.negative_zero = carrying, nonzero, negative_zero
+    s.lacking, s.first_lacking = lacking, first_lacking
+    return s
+
+
+def _records_of(path: str, count: int, offset: int = 0,
+                block: Optional[int] = None) -> Iterator[tuple]:
+    """The `count` tick records of scratch file `path` from byte `offset`, as
+    (ts, bid, ask, volume), read `block` records at a time."""
+    size = _TICK_RECORD.size
+    block = max(1, block or STREAM_BLOCK_RECORDS)
+    with open(path, "rb") as f:
+        f.seek(offset)
+        left = count
+        while left:
+            k = min(block, left)
+            data = f.read(k * size)
+            if len(data) != k * size:
+                raise OSError(f"The scratch file {path} is shorter than the ticks written to it")
+            left -= k
+            yield from _TICK_RECORD.iter_unpack(data)
+
+
+def _merge_runs(runs: List[Tuple[str, int]], dst: Optional[str]) -> int:
+    """Merge sorted runs [(path, records)], in their order, into `dst` (or
+    nowhere): a tick of an earlier run comes before a tick of a later run of
+    the same time. Returns how many ticks share the time of the tick before
+    them in the merged order."""
+    block = max(1, STREAM_BLOCK_RECORDS // max(MERGE_FAN_IN, 1))
+    streams_ = [_records_of(p, n, block=block) for p, n in runs]
+    pack = _TICK_RECORD.pack
+    duplicates, prev, first = 0, 0, True
+    out = open(dst, "wb") if dst is not None else None
+    try:
+        buf = bytearray()
+        # heapq.merge is sorted(itertools.chain(*runs), key=...): stable, so
+        # ties keep the order of the runs and, inside a run, their own.
+        for rec in heapq.merge(*streams_, key=itemgetter(0)):
+            ts = rec[0]
+            if ts == prev and not first:
+                duplicates += 1
+            prev, first = ts, False
+            if out is not None:
+                buf += pack(*rec)
+                if len(buf) >= _WRITE_BYTES:
+                    out.write(buf)
+                    buf.clear()
+        if out is not None:
+            out.write(buf)
+    finally:
+        if out is not None:
+            out.close()
+    return duplicates
+
+
+def _sort_spill(src: str, count: int, dst: Optional[str], workdir: str,
+                offset: int = 0) -> int:
+    """Write the `count` tick records of `src` (from byte `offset`) to `dst`
+    in time order, ties in file order -- what sorted(ticks, key=time) gives
+    the whole list -- holding at most SORT_RUN_TICKS of them in memory; with
+    `dst` None only count. Returns the ticks that share a time with the tick
+    before them in that order. The runs live in `workdir` and are removed."""
+    size = _TICK_RECORD.size
+    run = max(1, SORT_RUN_TICKS)
+    fan_in = max(2, MERGE_FAN_IN)
+    made: List[str] = []
+
+    def new_run() -> str:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        while True:
+            path = os.path.join(workdir, ".dataconvert-run-%d-%s.part"
+                                % (os.getpid(), secrets.token_hex(4)))
+            try:
+                os.close(os.open(path, flags, 0o600))
+            except FileExistsError:
+                continue
+            made.append(path)
+            return path
+
+    def remove(path: str) -> None:
+        os.remove(path)
+        made.remove(path)
+
+    try:
+        runs: List[Tuple[str, int]] = []
+        with open(src, "rb") as f:
+            f.seek(offset)
+            left = count
+            while left:
+                k = min(run, left)
+                data = f.read(k * size)
+                if len(data) != k * size:
+                    raise OSError(f"The scratch file {src} is shorter than the ticks written to it")
+                left -= k
+                # One int per tick, its time above its position: sorting
+                # them sorts by time, ties by position, without a key.
+                shift = max(1, (k - 1).bit_length())
+                mask = (1 << shift) - 1
+                keys = [(ts << shift) | i
+                        for i, ts in enumerate(memoryview(data).cast("q")[::4])]
+                keys.sort()
+                path = new_run()
+                with open(path, "wb") as out:
+                    for j in range(0, k, 1 << 16):
+                        out.write(b"".join([data[p:p + size] for p in
+                                            [(key & mask) * size for key in keys[j:j + (1 << 16)]]]))
+                del keys, data
+                runs.append((path, k))
+        while len(runs) > fan_in:
+            merged: List[Tuple[str, int]] = []
+            for g in range(0, len(runs), fan_in):
+                group = runs[g:g + fan_in]
+                if len(group) == 1:
+                    merged.append(group[0])
+                    continue
+                path = new_run()
+                _merge_runs(group, path)
+                for p, _n in group:
+                    remove(p)
+                merged.append((path, sum(n for _p, n in group)))
+            runs = merged
+        return _merge_runs(runs, dst)
+    finally:
+        for path in list(made):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def _refuse_streamed_unordered(path: str, ticks: _Spilled) -> None:
+    """_refuse_unordered for a streamed tick payload: raise RecordsNotInOrder,
+    naming the first descents, when a tick is earlier than the one before it
+    (ticks sharing a millisecond are legal)."""
+    if ticks.descents:
+        raise _unordered_refusal(path, ticks.count, "tick", True, ticks.first_descents,
+                                 ticks.descents, 0)
+
+
+def _spilled_ticks(path: str, count: int) -> Iterator[Dict]:
+    """The ticks of a scratch file written for bars, whose volume field is not
+    a number where the tick has none."""
+    for ts, bid, ask, volume in _records_of(path, count):
+        if volume == volume:
+            yield {"ts": ts, "bid": bid, "ask": ask, "volume": volume}
+        else:
+            yield {"ts": ts, "bid": bid, "ask": ask}
+
+
+class _Refusals:
+    """The records of a payload that cannot be market data: how many, and the
+    first REFUSAL_NAMES as the content check names them."""
+
+    __slots__ = ("bad", "entries")
+
+    def __init__(self) -> None:
+        self.bad = 0
+        self.entries: List[Dict] = []
+
+    def check(self, rec: Dict, position: int, what: str) -> None:
+        reason = record_problem(rec, what == "tick")
+        if reason is not None:
+            self.bad += 1
+            if len(self.entries) < REFUSAL_NAMES:
+                self.entries.append(_invalid_entry(dict(rec), position, what, reason))
+
+
+class _BarsWritten:
+    """What the bars written to a scratch file are: count, first and last
+    time, their volumes (as _Spilled counts them), the bars that cannot be
+    market data when written with volume (a bar without one as not a number,
+    as volume_of makes it) and without, and any bar not later than the one
+    before it (descents, repeats, the first of them as write_v2 names them;
+    bars made in time order have none)."""
+
+    __slots__ = ("count", "first", "last", "carrying", "nonzero", "negative_zero",
+                 "with_volume", "without_volume", "descents", "repeats", "unordered")
+
+
+def _write_bars(bars: Iterator[Bar], f) -> _BarsWritten:
+    """Write `bars` (ascending) to the open file `f` as bar records, each
+    with its volume (0.0 for a bar without one), and say what they are."""
+    pack = _BAR_RECORD.pack
+    buf = bytearray()
+    w = _BarsWritten()
+    w.count, w.first, w.last = 0, 0, 0
+    w.carrying, w.nonzero, w.negative_zero = 0, False, False
+    w.with_volume, w.without_volume = _Refusals(), _Refusals()
+    w.descents, w.repeats, w.unordered = 0, 0, []
+    for b in bars:
+        w.count += 1
+        if w.count == 1:
+            w.first = b["ts"]
+        elif b["ts"] <= w.last:
+            kind = "descent" if b["ts"] < w.last else "duplicate"
+            if kind == "descent":
+                w.descents += 1
+            else:
+                w.repeats += 1
+            if len(w.unordered) < 5:
+                w.unordered.append((kind, w.count - 2, w.last, w.count - 1, b["ts"]))
+        w.last = b["ts"]
+        if "volume" in b:
+            volume = b["volume"]
+            w.carrying += 1
+            if volume != 0.0:
+                w.nonzero = True
+            elif math.copysign(1.0, volume) < 0.0:
+                w.negative_zero = True
+            w.with_volume.check(b, w.count, "bar")
+            del b["volume"]
+            w.without_volume.check(b, w.count, "bar")
+        else:
+            volume = 0.0
+            w.without_volume.check(b, w.count, "bar")
+            b["volume"] = math.nan
+            w.with_volume.check(b, w.count, "bar")
+        buf += pack(b["ts"], b["open"], b["high"], b["low"], b["close"],
+                    b["bid"], b["ask"], volume)
+        if len(buf) >= _WRITE_BYTES:
+            f.write(buf)
+            buf.clear()
+    f.write(buf)
+    return w
+
+
+def _zero_volumes(path: str, offset: int, count: int, size: int) -> None:
+    """Set the volume field (a record's last 8 bytes) of the `count` records
+    of `size` bytes from byte `offset` of `path` to 0.0: a file written
+    without volume holds 0.0 there, and a -0.0 of the source is not 0.0."""
+    block = max(1, STREAM_BLOCK_RECORDS)
+    zero = bytes(8)
+    with open(path, "r+b") as f:
+        done = 0
+        while done < count:
+            k = min(block, count - done)
+            f.seek(offset + done * size)
+            data = bytearray(f.read(k * size))
+            for i in range(k):
+                data[i * size + size - 8:(i + 1) * size] = zero
+            f.seek(offset + done * size)
+            f.write(data)
+            done += k
+
+
+def _write_header(path: str, payload_type: int, tf_min: int, count: int,
+                  first_ts: int, last_ts: int, symbol: str) -> None:
+    """The BAR6 header, written over the first bytes of `path` (kept free
+    for it), exactly as write_v2 and write_ticks_v2 write it."""
+    sym_b = symbol.encode("ascii", errors="replace")[:16].ljust(16, b"\x00")
+    with open(path, "r+b") as f:
+        f.write(struct.pack(HDR_V2_FMT, MAGIC_V2, FORMAT_VERSION, payload_type,
+                            tf_min, count, first_ts, last_ts, sym_b))
+
+
+def _convert_streamed(input_path: str, output_path: str, symbol: str, tf_min: int,
+                      fmt: str, progress: ProgressFn, as_ticks: bool,
+                      source_tz: Optional[tzinfo], stats, no_volume: bool) -> dict:
+    """convert() for a tick source (streams()): the same file, the same
+    returned dict, the same refusals and the same progress lines as the
+    conversion that holds every tick in memory, plus a line when ticks are
+    sorted on disk. See "Streaming"."""
+    scratch = _Scratch(output_path)
+    succeeded = False
+    try:
+        result = _stream(scratch, input_path, output_path, symbol, tf_min, fmt, progress,
+                         as_ticks, source_tz, stats, no_volume)
+        succeeded = True
+        return result
+    finally:
+        scratch.close(succeeded)
+
+
+def _stream(scratch: _Scratch, input_path: str, output_path: str, symbol: str,
+            tf_min: int, fmt: str, progress: ProgressFn, as_ticks: bool,
+            source_tz: Optional[tzinfo], stats, no_volume: bool) -> dict:
+    if not as_ticks and fmt != "dukascopyweb":
+        _mark_tick_source(stats)      # as the bar parsers of a tick format do
+    end = _ParseEnd()
+    spill = scratch.new("ticks")
+    header = HDR_V2_SIZE if as_ticks else 0
+    with open(spill, "r+b") as f:
+        f.write(bytes(header))
+        ticks = _spill_ticks(TICK_STREAMS[fmt](input_path, progress, source_tz, stats, end),
+                             f, 0.0 if as_ticks else math.nan)
+    n = ticks.count
+    if not as_ticks and progress:
+        progress(f"  Aggregating {n:,} ticks -> M{tf_min} bars")
+    if not n:
+        raise ValueError("No ticks could be parsed from the input file" if as_ticks else
+                         "No bars could be parsed from the input file")
+
+    # The counts of _record: duplicates are counted in time order.
+    if ticks.descents:
+        if progress:
+            progress(f"  Sorting {n:,} ticks by time on disk")
+        if as_ticks:
+            duplicates = _sort_spill(spill, n, None, scratch.dir, offset=header)
+        else:
+            in_order = scratch.new("sorted")
+            duplicates = _sort_spill(spill, n, in_order, scratch.dir)
+            scratch.drop(spill)
+            spill = in_order
+    else:
+        duplicates = ticks.repeats
+    stats["rows_parsed"] += n
+    stats["skipped_rows"] += end.skipped
+    stats["out_of_order_rows"] += ticks.descents
+    stats["duplicate_timestamps"] += duplicates
+    if end.clock is not None:
+        stats["dst_repeated_rows"] = (stats.get("dst_repeated_rows", 0)
+                                      + end.clock.repeated_hour_rows)
+
+    _refuse_audited_with_counts(stats, output_path, progress, tick_payload=as_ticks)
+
+    if as_ticks:
+        state = _volume_state(fmt, no_volume, ticks.carrying, n, ticks.nonzero)
+        volume = "source" if state == "mixed" else state
+        _say_replacing(output_path, progress)
+        if progress:
+            progress(f"Writing {n:,} raw ticks -> {os.path.basename(output_path)}")
+        try:
+            if state == "mixed":
+                entries = []
+                for position, tick in ticks.first_lacking:
+                    tick["volume"] = math.nan
+                    entries.append(_invalid_entry(tick, position, "tick",
+                                                  record_problem(tick, tick=True)))
+                raise _invalid_refusal(output_path, n, "tick", entries, ticks.lacking)
+            _refuse_streamed_unordered(output_path, ticks)
+        except (RecordsNotInOrder, RecordsInvalid) as exc:
+            exc.counts = dict(stats)
+            if progress:
+                progress(counts_summary(stats, tick_payload=True))
+            raise
+        if volume != "source" and ticks.negative_zero:
+            _zero_volumes(spill, header, n, TICK_SIZE)
+        _write_header(spill, PAYLOAD_TICKS | (PAYLOAD_VOLUME_BIT if volume == "source" else 0),
+                      0, n, ticks.lo, ticks.hi, symbol)
+        scratch.becomes(spill, output_path)
+        n_bytes = HDR_V2_SIZE + n * TICK_SIZE
+        if progress:
+            progress(f"DONE  {n:,} ticks  |  "
+                     f"{ts_to_str(ticks.lo)} -> {ts_to_str(ticks.hi)}"
+                     f"  |  {n_bytes / 1024 / 1024:.2f} MB written")
+            progress(VOLUME_SAYS[volume])
+            progress(counts_summary(stats, tick_payload=True))
+        return {
+            "ticks":  n,
+            "bars":   n,
+            "bytes":  n_bytes,
+            "start":  ticks.lo,
+            "end":    ticks.hi,
+            "format": fmt,
+            "symbol": symbol,
+            "tf_min": 0,
+            "tick_source": True,
+            "quote_side": stats.quote_side,
+            "volume": volume,
+            **stats,
+        }
+
+    out = scratch.new("bars")
+    with open(out, "r+b") as f:
+        f.write(bytes(HDR_V2_SIZE))
+        bars = _write_bars(_bars_in_order(_spilled_ticks(spill, n), tf_min), f)
+    scratch.drop(spill)
+    state = _volume_state(fmt, no_volume, bars.carrying, bars.count, bars.nonzero)
+    volume = "source" if state == "mixed" else state
+    _say_replacing(output_path, progress)
+    if progress:
+        progress(f"Writing {bars.count:,} M{tf_min} bars -> {os.path.basename(output_path)}")
+    # A bar's problems as write_v2 checks them: with its volume when the file
+    # is written with volume, else without (volume_of drops it).
+    refused = bars.with_volume if volume == "source" else bars.without_volume
+    exc: Optional[ValueError] = None
+    if refused.bad:
+        exc = _invalid_refusal(output_path, bars.count, "bar", refused.entries, refused.bad)
+    elif bars.descents or bars.repeats:
+        exc = _unordered_refusal(output_path, bars.count, "bar", False, bars.unordered,
+                                 bars.descents, bars.repeats)
+    if exc is not None:
+        exc.counts = dict(stats)
+        if progress:
+            progress(counts_summary(stats))
+        raise exc
+    if volume != "source" and bars.negative_zero:
+        _zero_volumes(out, HDR_V2_SIZE, bars.count, BAR_SIZE)
+    _write_header(out, PAYLOAD_BARS | (PAYLOAD_VOLUME_BIT if volume == "source" else 0),
+                  tf_min, bars.count, bars.first, bars.last, symbol)
+    scratch.becomes(out, output_path)
+    n_bytes = HDR_V2_SIZE + bars.count * BAR_SIZE
+    if progress:
+        progress(f"DONE  {bars.count:,} bars  |  {ts_to_str(bars.first)} -> "
+                 f"{ts_to_str(bars.last)}  |  {n_bytes / 1024 / 1024:.2f} MB written")
+        progress(VOLUME_SAYS[volume])
+        progress(counts_summary(stats))
+    return {
+        "bars":   bars.count,
+        "bytes":  n_bytes,
+        "start":  bars.first,
+        "end":    bars.last,
+        "format": fmt,
+        "symbol": symbol,
+        "tf_min": tf_min,
+        "tick_source": stats.tick_source,
+        "quote_side": stats.quote_side,
+        "volume": volume,
+        **stats,
+    }
+
+
+def may_replace(output_path: str, ask: Callable[[str, str], bool]) -> bool:
+    """The window's question before it writes over a file that is there
+    (a BID and an ASK export of one symbol used to replace each other). True
+    when there is no such file, else the user's answer."""
+    if not os.path.exists(output_path):
+        return True
+    return bool(ask("Replace file?",
+                    f"{os.path.basename(output_path)} exists already.\n\nReplace it?"))
+
+
+def _say_replacing(output_path: str, progress: ProgressFn) -> None:
+    """Say it when the output replaces a file that is there (a BID and an ASK
+    export of one symbol converted to one name used to replace each other
+    without a word). Said after every check passed, just before the write."""
+    if progress and os.path.exists(output_path):
+        progress(f"Replacing the existing file {os.path.basename(output_path)}")
 
 
 def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
@@ -2526,8 +3794,13 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
             col_map: Optional[Dict[str, int]] = None,
             tz: Optional[str] = None,
             ignore_memory_check: bool = False,
-            point: Optional[float] = None) -> dict:
+            point: Optional[float] = None,
+            no_volume: bool = False) -> dict:
     """Convert input_path -> BAR6 output_path.
+
+    no_volume: write the file without volume even when the source has a
+             volume column (see "Volume"). The returned dict's `volume` says
+             which volume was written: source, zero, quoted, none or off.
 
     as_ticks=True: write raw ticks (payload_type=1, 32-byte TickRecord), for
              the formats in TICK_PARSERS.
@@ -2540,9 +3813,14 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
     tz: source timezone for formats that store a bare wall clock.
         An IANA name or a fixed offset. Required for those formats, refused
         for the ones whose timestamps already fix an instant.
-    ignore_memory_check: convert even when the estimated memory need is
-        more than is available (see check_memory). Without it such an input
-        raises NotEnoughMemory before it is parsed.
+    ignore_memory_check: convert even when the memory the conversion needs
+        is more than is available (see check_memory). Without it such an
+        input raises NotEnoughMemory before it is parsed.
+
+    A tick source streams (see "Streaming"): its ticks go through scratch
+    files beside the output and the conversion holds at most
+    STREAMING_MEMORY_MB, with the same output, returned dict and refusals as
+    holding them all. A bar source is parsed into memory, as before.
 
     The returned dict carries `rows_parsed`, `skipped_rows`,
     `out_of_order_rows`, `duplicate_timestamps` and `dst_repeated_rows` on
@@ -2562,11 +3840,27 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
     stamped one instant. Raises RecordsInvalid, with the counts too, when a
     record cannot be market data (a high below its low, a price of zero or
     less, a value that is not a number): it names the source rows. No output
-    file is created in either case. `start` and `end` in the returned dict are the payload's earliest and
-    latest timestamp, not its first and last record.
+    file is created in either case, and a file already at the output's name is
+    left as it was. A streamed refusal's `offenders` holds the records it
+    names (the first ones), not all of them. `start` and `end` in the
+    returned dict are the payload's earliest and latest timestamp, not its
+    first and last record.
     """
     if not os.path.exists(input_path):
         raise FileNotFoundError(f"Input not found: {input_path}")
+
+    # A column mapping belongs to the generic reader. With the format on auto
+    # it chooses that reader; with any other format it is refused. It used to
+    # be dropped without a word when auto detected another format.
+    if col_map:
+        if fmt is None:
+            fmt = "generic"
+            if progress:
+                progress("Format: generic, read with the column mapping you made")
+        elif fmt != "generic":
+            raise ValueError(
+                f"A column mapping is used with the generic format only; format {fmt!r} "
+                f"reads its own columns. Choose generic (or auto) to use the mapping.")
 
     if fmt is None:
         fmt = detect_format(input_path)
@@ -2588,11 +3882,12 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
                 f"exports; format {fmt!r} has no spread column.")
         if not (point > 0 and math.isfinite(point)):
             raise ValueError(f"A point is a price step above zero; got {point!r}.")
-    # The memory the parse will need, said before it starts, and refused when
-    # the computer does not have it: an out-of-memory error after a long run
-    # tells the user nothing they could have acted on.
-    check_memory(input_path, fmt, progress, ignore=ignore_memory_check)
+    # The memory the conversion will need, said before it starts, and refused
+    # when the computer does not have it: an out-of-memory error after a long
+    # run tells the user nothing they could have acted on.
+    check_memory(input_path, fmt, progress, ignore=ignore_memory_check, as_ticks=as_ticks)
     stats = new_conversion_counts()
+    stats.read_volume = not (no_volume or fmt in QUOTED_SIZE_FORMATS)
     if progress and source_tz is not None:
         carried = (f"zone rules carried by DataConvert, IANA {ZONES_VERSION}; "
                    if is_carried(source_tz) else "")
@@ -2608,47 +3903,23 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
             )
         if progress:
             progress(f"Parsing {os.path.basename(input_path)} as [{fmt}] (raw ticks)")
-        ticks = TICK_PARSERS[fmt](input_path, progress, tz=source_tz, stats=stats)
-        if not ticks:
-            raise ValueError("No ticks could be parsed from the input file")
-        _refuse_audited_with_counts(stats, output_path, progress, tick_payload=True)
-        if progress:
-            progress(f"Writing {len(ticks):,} raw ticks -> {os.path.basename(output_path)}")
-        # write_ticks_v2 refuses a payload that descends. The counts
-        # travel with the refusal, and out through `progress`, because they are
-        # what explains it: "2 rows out of order" on a four-tick export names
-        # the source's problem, where the exception alone names only ours.
-        try:
-            n_bytes = write_ticks_v2(output_path, ticks, symbol)
-        except (RecordsNotInOrder, RecordsInvalid) as exc:
-            exc.counts = dict(stats)
-            if progress:
-                progress(counts_summary(stats, tick_payload=True))
-            raise
-        start, end = _payload_span(ticks)
-        if progress:
-            progress(f"DONE  {len(ticks):,} ticks  |  "
-                     f"{ts_to_str(start)} -> {ts_to_str(end)}"
-                     f"  |  {n_bytes / 1024 / 1024:.2f} MB written")
-            progress(counts_summary(stats, tick_payload=True))
-        return {
-            "ticks":  len(ticks),
-            "bars":   len(ticks),
-            "bytes":  n_bytes,
-            "start":  start,
-            "end":    end,
-            "format": fmt,
-            "symbol": symbol,
-            "tf_min": 0,
-            **stats,
-        }
+        # The ticks stream into the output (see "Streaming"); a payload that
+        # descends is refused, and the counts travel with the refusal and out
+        # through `progress`, because they are what explains it: "2 rows out
+        # of order" on a four-tick export names the source's problem, where
+        # the exception alone names only ours.
+        return _convert_streamed(input_path, output_path, symbol, 0, fmt, progress,
+                                 True, source_tz, stats, no_volume)
 
-    # Bar output path (original)
+    # Bar output path
     parser_fn, _ = FORMATS[fmt]
     if progress:
         progress(f"Parsing {os.path.basename(input_path)} as [{fmt}]")
+    if streams(input_path, fmt):
+        return _convert_streamed(input_path, output_path, symbol, tf_min, fmt, progress,
+                                 False, source_tz, stats, no_volume)
 
-    if col_map and fmt in ("generic", None):
+    if col_map and fmt == "generic":
         bars = parse_generic(input_path, tf_min, progress, col_map=col_map,
                              tz=source_tz, stats=stats)
     elif fmt in SPREAD_FORMATS:
@@ -2659,6 +3930,8 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
     if not bars:
         raise ValueError("No bars could be parsed from the input file")
     _refuse_audited_with_counts(stats, output_path, progress)
+    volume = volume_of(bars, fmt, no_volume)
+    _say_replacing(output_path, progress)
 
     if progress:
         progress(f"Writing {len(bars):,} M{tf_min} bars -> {os.path.basename(output_path)}")
@@ -2666,7 +3939,8 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
     # write_v2 refuses two bars stamped the same instant. Same
     # reasoning as the tick path above -- the counts explain the refusal.
     try:
-        n_bytes = write_v2(output_path, bars, symbol, tf_min)
+        n_bytes = write_v2(output_path, bars, symbol, tf_min,
+                           with_volume=volume == "source")
     except (RecordsNotInOrder, RecordsInvalid) as exc:
         exc.counts = dict(stats)
         if progress:
@@ -2677,6 +3951,7 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
     if progress:
         progress(f"DONE  {len(bars):,} bars  |  {ts_to_str(start)} -> {ts_to_str(end)}"
                  f"  |  {n_bytes / 1024 / 1024:.2f} MB written")
+        progress(VOLUME_SAYS[volume])
         progress(counts_summary(stats))
 
     return {
@@ -2687,6 +3962,9 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
         "format": fmt,
         "symbol": symbol,
         "tf_min": tf_min,
+        "tick_source": stats.tick_source,
+        "quote_side": stats.quote_side,
+        "volume": volume,
         **stats,
     }
 
@@ -2695,7 +3973,9 @@ def convert(input_path: str, output_path: str, symbol: str, tf_min: int,
 # --info: inspect an existing .bin file
 # =============================================================================
 class NotABarFile(ValueError):
-    """Raised by cmd_info for a file too short to hold its format's header."""
+    """Raised by describe_bin (and so by cmd_info) for a file it cannot
+    describe: too short for its format's header, of an unknown version or
+    payload type, or not holding the records its header states."""
 
 
 #: The BAR5 header: magic, version, timeframe, count, start, end.
@@ -2703,16 +3983,43 @@ _HDR_V1_FMT = "<IIIIqq"
 _HDR_V1_SIZE = struct.calcsize(_HDR_V1_FMT)  # 32
 
 
+class BinInfo(NamedTuple):
+    """What a .bin file's header says (describe_bin): the lines shown, the
+    refusal that follows them when the file does not hold what its header
+    states (or None), and `known`, False when the file is no BAR file."""
+    lines: List[str]
+    problem: Optional[NotABarFile]
+    known: bool
+
+
 def cmd_info(path: str) -> None:
-    """Print a .bin file's header.
+    """Print a .bin file's header (describe_bin).
 
     Raises OSError when the file cannot be read, and NotABarFile when it is
     shorter than the header its magic announces, when a BAR6 header names a
     version or a payload type this tool does not know, or when the file's size
     does not match the records its header states (the header is printed
     first, then the sentence); main() reports either as a one-line error
-    rather than a traceback. Reads the header only, never more.
+    rather than a traceback. Exits with 1 for a file of no BAR format. Reads
+    the header only, never more.
     """
+    info = describe_bin(path)
+    for line in info.lines:
+        print(line)
+    if not info.known:
+        sys.exit(1)
+    if info.problem is not None:
+        raise info.problem
+
+
+def describe_bin(path: str) -> BinInfo:
+    """A .bin file's header as --info and the window's "Inspect .bin" show
+    it: the kind from bit 0 of payload_type, the volume from bit 1, the
+    record size of that kind, and the file size checked against the records.
+    Raises OSError and NotABarFile as cmd_info describes, before any line
+    when nothing of the header can be shown."""
+    lines: List[str] = []
+    problem: Optional[NotABarFile] = None
     with open(path, "rb") as f:
         raw = f.read(max(HDR_V2_SIZE, _HDR_V1_SIZE))
 
@@ -2735,44 +4042,55 @@ def cmd_info(path: str) -> None:
             raise NotABarFile(f"{path} is a BAR6 file of version {ver}; this tool "
                               f"reads version {FORMAT_VERSION} only, so its header "
                               f"cannot be read")
-        if pt not in (PAYLOAD_BARS, PAYLOAD_TICKS):
+        if pt > (PAYLOAD_TICKS | PAYLOAD_VOLUME_BIT):
             raise NotABarFile(f"{path} is a BAR6 file with payload type {pt}; "
-                              f"only {PAYLOAD_BARS} (bars) and {PAYLOAD_TICKS} "
-                              f"(ticks) exist, so its records cannot be read")
+                              f"only 0 (bars), 1 (ticks), 2 (bars with volume) and "
+                              f"3 (ticks with volume) exist, so its records cannot be read")
         sym = sym_b.rstrip(b"\x00").decode("ascii", errors="replace")
-        rec_size = TICK_SIZE if pt == PAYLOAD_TICKS else BAR_SIZE
-        print(f"File:        {path}")
-        print(f"Format:      BAR6")
-        print(f"Version:     {ver}")
-        print(f"Symbol:      {sym or '(empty)'}")
-        print(f"Payload:     {'ticks (type=1, 32 B)' if pt == PAYLOAD_TICKS else 'bars (type=0, 56 B)'}")
-        print(f"Timeframe:   {'tick (M0)' if tf == 0 else f'M{tf}'}")
-        print(f"Records:     {count:,}")
-        print(f"Start:       {ts_to_str(ts0)}")
-        print(f"End:         {ts_to_str(ts1)}")
+        ticks = bool(pt & PAYLOAD_TICKS)
+        rec_size = TICK_SIZE if ticks else BAR_SIZE
+        with_volume = " with volume" if pt & PAYLOAD_VOLUME_BIT else ""
+        lines.append(f"File:        {path}")
+        lines.append(f"Format:      BAR6")
+        lines.append(f"Version:     {ver}")
+        lines.append(f"Symbol:      {sym or '(empty)'}")
+        lines.append(f"Payload:     {'ticks' if ticks else 'bars'}{with_volume} "
+                     f"(type={pt}, {rec_size} B)")
+        lines.append(f"Timeframe:   {'tick (M0)' if tf == 0 else f'M{tf}'}")
+        lines.append(f"Records:     {count:,}")
+        lines.append(f"Start:       {ts_to_str(ts0)}")
+        lines.append(f"End:         {ts_to_str(ts1)}")
         expected = HDR_V2_SIZE + count * rec_size
         actual   = os.path.getsize(path)
         ok = "OK" if actual == expected else f"MISMATCH (expected {expected:,}, got {actual:,})"
-        print(f"File size:   {actual:,} bytes  {ok}")
-        if actual != expected:
+        lines.append(f"File size:   {actual:,} bytes  {ok}")
+        if (actual != expected and not ticks and count > 0
+                and actual == HDR_V2_SIZE + count * EARLIER_BAR_SIZE):
+            problem = NotABarFile(
+                f"{path} was written in the earlier BAR6 bar layout ({EARLIER_BAR_SIZE}-byte "
+                f"bar records, before the volume field). Convert the source data again "
+                f"with this DataConvert")
+        elif actual != expected:
             whole = max(actual - HDR_V2_SIZE, 0) // rec_size
-            raise NotABarFile(
+            problem = NotABarFile(
                 f"{path} does not hold the records its header states: the header "
                 f"names {count:,} record(s) of {rec_size} bytes, the file holds "
                 f"{whole:,} whole record(s) and {actual:,} bytes in all. It was cut "
                 f"short or changed after it was written; convert the source data again")
-    elif magic == MAGIC_V1:
+        return BinInfo(lines, problem, True)
+    if magic == MAGIC_V1:
         mg, ver, tf, count, ts0, ts1 = struct.unpack_from(_HDR_V1_FMT, raw)
-        print(f"File:        {path}")
-        print(f"Format:      BAR5  (older format -- convert the source data again to get BAR6)")
-        print(f"Timeframe:   M{tf}")
-        print(f"Bars:        {count:,}")
-        print(f"Start:       {ts_to_str(ts0)}")
-        print(f"End:         {ts_to_str(ts1)}")
-    else:
-        print(f"File:        {path}")
-        print(f"Format:      UNKNOWN  (magic 0x{magic:08X})")
-        sys.exit(1)
+        lines.append(f"File:        {path}")
+        lines.append(f"Format:      BAR5  (older format -- convert the source data again "
+                     f"to get BAR6)")
+        lines.append(f"Timeframe:   M{tf}")
+        lines.append(f"Bars:        {count:,}")
+        lines.append(f"Start:       {ts_to_str(ts0)}")
+        lines.append(f"End:         {ts_to_str(ts1)}")
+        return BinInfo(lines, None, True)
+    lines.append(f"File:        {path}")
+    lines.append(f"Format:      UNKNOWN  (magic 0x{magic:08X})")
+    return BinInfo(lines, None, False)
 
 
 # =============================================================================
@@ -3019,6 +4337,7 @@ def run_gui() -> None:
             ("high",  "High *",  True),
             ("low",   "Low *",   True),
             ("close", "Close *", True),
+            ("volume", "Volume (optional, traded volume only)", False),
         ]
         vars_: Dict[str, tk.StringVar] = {}
         grid = tk.Frame(dlg, bg=C["bg"])
@@ -3130,6 +4449,17 @@ def run_gui() -> None:
     tk.Label(ticks_row, text="  <- Timeframe ignored when ticked",
              bg=C["bg"], fg=C["muted"], font=(C["ui"][0], 7)).pack(side="left")
 
+    # Write without volume (the command line's --no-volume)
+    v_no_volume = tk.BooleanVar(value=False)
+    volume_row = tk.Frame(main, bg=C["bg"])
+    volume_row.pack(fill="x", pady=(0, 8))
+    tk.Checkbutton(
+        volume_row, text="Write without volume  (even when the source has a volume column)",
+        variable=v_no_volume, bg=C["bg"], fg=C["text"],
+        activebackground=C["bg"], activeforeground=C["accent"],
+        selectcolor=C["surf2"], font=(C["ui"][0], 8),
+    ).pack(side="left")
+
     def _on_ticks_toggle():
         """Auto-update output filename suffix when toggling tick mode."""
         out = v_output.get().strip()
@@ -3173,7 +4503,7 @@ def run_gui() -> None:
         sym = v_symbol.get() or p.stem.split("_")[0]
         tf  = v_tf.get() or "5"
         if not v_output.get():
-            v_output.set(str(p.parent / f"{sym}_M{tf}.bin"))
+            v_output.set(str(p.parent / default_output_name(path, sym, tf)))
         # Auto-detect format
         detected = detect_format(path)
         if detected in FORMATS:
@@ -3182,9 +4512,10 @@ def run_gui() -> None:
     def browse_output():
         sym = v_symbol.get().strip() or "output"
         tf  = v_tf.get() or "5"
+        inp = v_input.get().strip()
         path = filedialog.asksaveasfilename(
             title="Save binary file as",
-            initialfile=f"{sym}_M{tf}.bin",
+            initialfile=default_output_name(inp, sym, tf) if inp else f"{sym}_M{tf}.bin",
             defaultextension=".bin",
             filetypes=[("Binary bar file", "*.bin"), ("All files", "*.*")])
         if path:
@@ -3247,6 +4578,8 @@ def run_gui() -> None:
         if not inp:  messagebox.showerror("Error", "No input file selected"); return
         if not out:  messagebox.showerror("Error", "No output file specified"); return
         if not sym:  messagebox.showerror("Error", "Symbol name is required"); return
+        if not may_replace(out, messagebox.askyesno):
+            return
         point = None
         if v_point.get().strip():
             try:
@@ -3260,6 +4593,7 @@ def run_gui() -> None:
         status_lbl.configure(fg=C["dim"])
         v_status.set("Converting")
         as_ticks = v_as_ticks.get()
+        no_volume = v_no_volume.get()
         active_col_map = dict(_col_map) if _col_map else None
         tz_spec = v_tz.get().strip() or None
 
@@ -3268,7 +4602,7 @@ def run_gui() -> None:
                 result = convert(inp, out, sym, tf, fmt, log,
                                  as_ticks=as_ticks, col_map=active_col_map,
                                  tz=tz_spec, ignore_memory_check=ignore_memory,
-                                 point=point)
+                                 point=point, no_volume=no_volume)
                 root.after(0, lambda: on_done(result))
             except NotEnoughMemory as exc:
                 root.after(0, lambda e=exc: on_memory(e))
@@ -3315,9 +4649,18 @@ def run_gui() -> None:
         ticks_written = result.get("tf_min") == 0
         log(f"Out of order, {'refused' if ticks_written else 'sorted':<7}: {shuffled:,}",
             "dim" if not shuffled else "")
+        # Bars made from ticks take in every tick of their period,
+        # those sharing a time included; nothing was refused.
         log(f"Duplicate timestamps: {dupes:,}"
-            + ("  (legal in a tick file)" if ticks_written else ""),
+            + ("  (legal in a tick file)" if ticks_written
+               else "  (ticks aggregated into their bar)" if result.get("tick_source")
+               else ""),
             "dim" if not dupes else "")
+        if result.get("quote_side") or (result.get("format") == "dukascopyweb"):
+            side = (result.get("quote_side") or "").upper()
+            log(f"Prices: {'the ' + side + ' side' if side else 'one side of the quote'} "
+                f"only. The file holds no spread; a backtest on it charges the spread "
+                f"set for the run.")
         if skipped:
             log("Those rows are not in the output file. Check the source "
                 "export's delimiter, date format and column order.", "red")
@@ -3335,30 +4678,18 @@ def run_gui() -> None:
             messagebox.showerror("Error", f"File not found: {path}")
             return
         clear_log()
+        # The same reading of the header as --info (describe_bin), so the
+        # window and the command line say the same about one file.
         try:
-            with open(path, "rb") as f:
-                raw = f.read(HDR_V2_SIZE)
-            magic = struct.unpack_from("<I", raw, 0)[0]
-            if magic == MAGIC_V2:
-                _, ver, pt, tf, count, ts0, ts1, sym_b = struct.unpack_from(HDR_V2_FMT, raw)
-                sym = sym_b.rstrip(b"\x00").decode("ascii", errors="replace")
-                rec_size = TICK_SIZE if pt == PAYLOAD_TICKS else BAR_SIZE
-                log(f"Format:    BAR6", "accent")
-                log(f"Symbol:    {sym or '(empty)'}")
-                log(f"Payload:   {'ticks (payload_type=1, 32 B)' if pt == PAYLOAD_TICKS else 'bars (payload_type=0, 56 B)'}")
-                log(f"Timeframe: {'tick (M0)' if tf == 0 else f'M{tf}'}")
-                log(f"{'Ticks' if pt == PAYLOAD_TICKS else 'Bars'}:      {count:,}")
-                log(f"Start:     {ts_to_str(ts0)}")
-                log(f"End:       {ts_to_str(ts1)}")
-                exp = HDR_V2_SIZE + count * rec_size
-                act = os.path.getsize(path)
-                log(f"Size:      {act:,} bytes  {'OK' if act == exp else 'MISMATCH'}")
-            elif magic == MAGIC_V1:
-                log(f"Format:    BAR5  (older format -- convert the source data again to get BAR6)", "dim")
-            else:
-                log(f"Unknown magic: 0x{magic:08X}", "red")
+            info = describe_bin(path)
         except Exception as exc:
             log(f"ERROR: {exc}", "red")
+            return
+        for line in info.lines:
+            log(line, "accent" if line.startswith("Format:") and info.known
+                else "" if info.known else "red")
+        if info.problem is not None:
+            log(f"ERROR: {info.problem}", "red")
 
     root.mainloop()
 
@@ -3384,8 +4715,9 @@ def main() -> None:
                         help="Input format (default: auto-detect)")
     parser.add_argument("--ticks",  action="store_true",
                         help="Write raw ticks (payload_type=1, 32-byte TickRecord). "
-                             "Only for tick formats (dukascopy, mt5ticks, "
-                             "ninjatraderticks, genericticks). Ignores --tf.")
+                             "Only for tick formats (dukascopy, dukascopyweb tick "
+                             "exports, mt5ticks, ninjatraderticks, genericticks). "
+                             "Ignores --tf.")
     parser.add_argument("--tz",
                         help="Source timezone of the input timestamps. "
                              "An IANA zone name such as Europe/Helsinki (DST-aware) "
@@ -3394,7 +4726,7 @@ def main() -> None:
                              "mt5ticks, ninjatrader, ninjatraderticks, tradestation, "
                              "generic, genericticks); refused for formats whose "
                              "timestamps already fix an instant (dukascopy, "
-                             "binance, bybit, tradingview).")
+                             "dukascopyweb, binance, bybit, tradingview).")
     parser.add_argument("--point", type=float,
                         help="The price of one point of an MT4/MT5 spread column "
                              "(mt4, mt5, mt4hst), e.g. 0.00001 for EURUSD at five "
@@ -3402,6 +4734,9 @@ def main() -> None:
                              "decimals the CSV's prices are written with.")
     parser.add_argument("--ignore-memory-check", action="store_true",
                         help="Convert even when the file needs more memory than is available")
+    parser.add_argument("--no-volume", action="store_true",
+                        help="Write the file without volume, even when the source has a "
+                             "volume column")
     parser.add_argument("--gui",    action="store_true", help="Launch GUI")
     parser.add_argument("--info",   metavar="FILE",      help="Print header info of a .bin file")
     parser.add_argument("--formats", action="store_true", help="List all supported input formats")
@@ -3439,7 +4774,7 @@ def main() -> None:
         result = convert(args.input, args.output, args.symbol, args.tf or 0,
                          fmt=args.format, progress=print, as_ticks=args.ticks,
                          tz=args.tz, ignore_memory_check=args.ignore_memory_check,
-                         point=args.point)
+                         point=args.point, no_volume=args.no_volume)
         # `convert` already printed the full count line through
         # `progress`. This repeats the one count that is a LOSS, on stderr, so
         # it survives a run whose stdout is piped into a log nobody reads and
